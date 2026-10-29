@@ -1,0 +1,51 @@
+[project]
+name = "tg-bot"
+version = "0.1.0"
+description = "Корпоративный Telegram-бот: ответы по документации проекта"
+requires-python = ">=3.12"
+dependencies = [
+    "aerich>=0.9",
+    "aiogram>=3.15,<4",
+    "argon2-cffi>=23.1",
+    "pydantic-settings>=2.6",
+    "redis>=5.2",
+    "tortoise-orm[asyncpg]>=0.25",
+    "tzdata>=2026.6",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "fakeredis>=2.40.0",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.aerich]
+tortoise_orm = "app.storage.postgres.config.TORTOISE_ORM"
+location = "./migrations"
+src_folder = "./."
+
+[tool.ruff.lint.flake8-bugbear]
+# Depends(...) в значении по умолчанию — механизм DI (app/core/depends.py), как в FastAPI
+extend-immutable-calls = ["app.core.depends.Depends"]
+
+[tool.ruff.lint.per-file-ignores]
+# MockedSession повторяет сигнатуры BaseSession aiogram, включая параметр timeout
+"tests/bot/conftest.py" = ["ASYNC109"]
