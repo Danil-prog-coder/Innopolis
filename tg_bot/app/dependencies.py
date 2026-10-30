@@ -18,6 +18,7 @@ from app.core.depends import Depends, DependsResolver
 from app.core.security import ProjectPasswordManager
 from app.llm.gateway import LLMGateway, StubLLMGateway
 from app.services.access_service import AccessGuard
+from app.services.digest_service import DigestService
 from app.services.docs_service import DocsService
 from app.services.group_chat_service import GroupChatService
 from app.services.invite_service import InviteService
@@ -40,6 +41,7 @@ from app.storage.redis.client import RedisClient
 from app.storage.redis.docs_draft_work import RedisDocsDraftWork
 from app.storage.redis.password_reveal_work import RedisPasswordRevealWork
 from app.storage.redis.rate_limit_work import RedisRateLimitWork
+from app.storage.redis.scheduler_work import RedisSchedulerWork
 
 # --- Синглтоны ---
 
@@ -177,6 +179,12 @@ def get_obj_docs_draft_work(
     return RedisDocsDraftWork(client)
 
 
+def get_obj_scheduler_work(
+    client: RedisClient = Depends(get_obj_redis_client),
+) -> RedisSchedulerWork:
+    return RedisSchedulerWork(client)
+
+
 # --- Сервисы ---
 
 
@@ -266,6 +274,14 @@ def get_obj_docs_service(
     access_guard: AccessGuard = Depends(get_obj_access_guard),
 ) -> DocsService:
     return DocsService(llm_gateway, project_work, doc_update_work, membership_work, access_guard)
+
+
+def get_obj_digest_service(
+    question_work: PostgresQuestionWork = Depends(get_obj_question_work),
+    project_work: PostgresProjectWork = Depends(get_obj_project_work),
+    membership_work: PostgresMembershipWork = Depends(get_obj_membership_work),
+) -> DigestService:
+    return DigestService(question_work, project_work, membership_work)
 
 
 def get_obj_group_chat_service(

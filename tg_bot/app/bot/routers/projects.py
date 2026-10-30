@@ -1,7 +1,7 @@
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InputRichMessage, Message
 
 from app.bot import keyboards, texts, views
 from app.bot.callbacks import ChangesCb, MenuAction, MenuCb, SwitchProjectCb
@@ -94,9 +94,10 @@ async def show_changes(
         await views.alert(callback, error)
         return
     await callback.answer()
-    # Сводку пишет ИИ-часть — отправляем как обычный текст, без HTML
-    for part in texts.split_message(summary):
-        await callback.message.answer(part, parse_mode=None)
+    # Сводку пишет ИИ-часть в Markdown
+    await views.send_rich(
+        callback.bot, callback.message.chat.id, InputRichMessage(markdown=summary), fallback=summary
+    )
 
 
 def create_router() -> Router:

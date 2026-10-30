@@ -1135,7 +1135,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aerich", specifier = ">=0.9" },
-    { name = "aiogram", specifier = ">=3.15,<4" },
+    { name = "aiogram", specifier = ">=3.31,<4" },
     { name = "argon2-cffi", specifier = ">=23.1" },
     { name = "pydantic-settings", specifier = ">=2.6" },
     { name = "redis", specifier = ">=5.2" },

@@ -4,7 +4,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyParameters
+from aiogram.types import CallbackQuery, InputRichMessage, Message, ReplyParameters
 
 from app.bot import keyboards, texts, views
 from app.bot.callbacks import AnswerQuestionCb, SaveKnowledgeCb
@@ -43,15 +43,16 @@ async def start_answer(
 
 async def deliver_answer(bot: Bot, question: Question) -> bool:
     """Отправить ответ админа туда, где задан вопрос (личка или групповой чат)."""
-    parts = texts.split_message(texts.answer_to_asker(question.text, question.answer))
     try:
-        for index, part in enumerate(parts):
-            reply = (
-                ReplyParameters(message_id=question.message_id, allow_sending_without_reply=True)
-                if index == 0
-                else None
-            )
-            await bot.send_message(question.chat_id, part, parse_mode=None, reply_parameters=reply)
+        await views.send_rich(
+            bot,
+            question.chat_id,
+            InputRichMessage(html=texts.answer_to_asker_rich(question.text, question.answer)),
+            fallback=texts.answer_to_asker(question.text, question.answer),
+            reply_parameters=ReplyParameters(
+                message_id=question.message_id, allow_sending_without_reply=True
+            ),
+        )
     except TelegramAPIError as error:
         logger.info("Cannot deliver answer for question %s: %s", question.id, error)
         return False

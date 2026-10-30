@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import StateFilter
-from aiogram.types import Message, ReplyParameters
+from aiogram.types import InputRichMessage, Message, ReplyParameters
 
 from app.bot import keyboards, texts, views
 from app.bot.notifier import Notifier
@@ -33,11 +33,14 @@ async def deliver_outcome(
     """Ответ — автору в тот же чат; нет ответа — сообщить автору и передать вопрос админам."""
     if outcome.answer is not None:
         reply = ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True)
-        for index, part in enumerate(texts.split_message(outcome.answer)):
-            # Ответ ИИ — обычный текст: без HTML, чтобы не ломаться на «<» и «&»
-            await message.answer(
-                part, parse_mode=None, reply_parameters=reply if index == 0 else None
-            )
+        # Ответ ИИ — в Markdown: заголовки, списки, таблицы и код Telegram покажет как есть
+        await views.send_rich(
+            message.bot,
+            message.chat.id,
+            InputRichMessage(markdown=outcome.answer),
+            fallback=outcome.answer,
+            reply_parameters=reply,
+        )
         return
 
     question = outcome.question

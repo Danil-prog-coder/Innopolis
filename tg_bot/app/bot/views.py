@@ -4,7 +4,7 @@ import logging
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InputRichMessage, Message, ReplyParameters
 
 from app.bot import keyboards, texts
 from app.core.errors import (
@@ -82,6 +82,29 @@ async def send_project_home(bot: Bot, chat_id: int, current: CurrentProject) -> 
     await bot.send_message(
         chat_id, texts.main_menu(current.project.name), reply_markup=keyboards.main_menu_kb(current)
     )
+
+
+async def send_rich(
+    bot: Bot,
+    chat_id: int,
+    rich: InputRichMessage,
+    fallback: str,
+    reply_parameters: ReplyParameters | None = None,
+) -> None:
+    """Отправить Rich Message (заголовки, списки, таблицы, код — Bot API 10.1+).
+
+    Если текст длиннее лимита или Telegram не принял разметку (её пишет ИИ, она может быть
+    битой), отправляем ``fallback`` обычным текстом без parse_mode, разбив на части.
+    """
+    if len(rich.markdown or rich.html or "") <= texts.TELEGRAM_RICH_MESSAGE_LIMIT:
+        try:
+            await bot.send_rich_message(chat_id, rich, reply_parameters=reply_parameters)
+            return
+        except TelegramBadRequest as error:
+            logger.warning("Rich message rejected in chat %s: %s", chat_id, error.message)
+    for index, part in enumerate(texts.split_message(fallback)):
+        reply = reply_parameters if index == 0 else None
+        await bot.send_message(chat_id, part, parse_mode=None, reply_parameters=reply)
 
 
 async def bot_username(bot: Bot) -> str:

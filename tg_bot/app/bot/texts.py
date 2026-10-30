@@ -2,7 +2,8 @@
 
 Сообщения уходят с parse_mode=HTML, поэтому пользовательские данные в функциях ниже
 экранируются. Текст кнопок и всплывающих окон Telegram не разбирает как HTML —
-там экранировать нельзя. Ответы ИИ и админа отправляются без parse_mode (см. split_message).
+там экранировать нельзя. Ответы ИИ и админа уходят Rich Message (Bot API 10.1+), а если
+Telegram его не принял — обычным текстом без parse_mode (см. views.send_rich, split_message).
 """
 
 from html import escape
@@ -10,6 +11,7 @@ from html import escape
 from app.core.enums import MemberRole
 
 TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_RICH_MESSAGE_LIMIT = 32768
 TELEGRAM_CAPTION_LIMIT = 1024
 CAPTION_QUESTION_LEN = 800
 _PROJECT_BUTTON_NAME_LEN = 40
@@ -290,9 +292,37 @@ def admin_unanswered(project_name: str, question: str, max_question_len: int = 3
     )
 
 
+def weekly_digest(
+    project_name: str, total: int, pending: int, latest: list[tuple[str, bool]]
+) -> str:
+    """Еженедельная сводка админу. ``latest`` — (текст вопроса, ждёт ли он ответа)."""
+    lines = "\n".join(
+        f"{'⏳' if is_pending else '✅'} {escape(_shorten(text, 200))}"
+        for text, is_pending in latest
+    )
+    return (
+        f"📊 <b>Неделя в проекте «{escape(project_name)}»</b>\n"
+        f"Вопросов, на которые не нашлось ответа в документации: {total}. "
+        f"Ждут ответа админа: {pending}.\n\n"
+        f"Последние вопросы (⏳ — ждёт ответа, ✅ — админ ответил):\n{lines}\n\n"
+        "Чтобы бот отвечал на такие вопросы сам, дополните документацию."
+    )
+
+
 def answer_to_asker(question: str, answer: str) -> str:
-    """Текст без HTML: ответ админа отправляется без parse_mode."""
+    """Текст без HTML: запасной вариант, если Rich Message не отправился."""
     return f"Ответ админа на ваш вопрос «{question}»:\n\n{answer}"
+
+
+def answer_to_asker_rich(question: str, answer: str) -> str:
+    """Rich HTML ответа админа. Каждая строка — свой абзац: переводы строк админа
+    сохраняются, а его текст не разбирается как разметка."""
+    paragraphs = "".join(f"<p>{escape(line)}</p>" for line in answer.splitlines() if line.strip())
+    return (
+        "<p><b>Ответ админа на ваш вопрос</b></p>"
+        f"<blockquote>{escape(question)}</blockquote>"
+        f"{paragraphs}"
+    )
 
 
 def group_not_bound(bot_username: str) -> str:

@@ -62,3 +62,22 @@ def test_settings_missing_token_fails(env):
     env.delenv("BOT_TOKEN")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_settings_schedule_defaults(env):
+    settings = Settings(_env_file=None)
+    assert (settings.scheduler_timezone, settings.digest_weekday, settings.digest_hour) == (
+        "Europe/Moscow",
+        0,
+        10,
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("SCHEDULER_TIMEZONE", "Mars/Olympus"), ("DIGEST_WEEKDAY", "7"), ("DIGEST_HOUR", "24")],
+)
+def test_settings_reject_bad_schedule(env, key, value):
+    env.setenv(key, value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)

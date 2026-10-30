@@ -18,6 +18,7 @@ class RedisKey(StrEnum):
     PASSWORD_REVEAL = "password_reveal:{project_id}"
     DOCS_DRAFT = "docs_draft:{telegram_id}:{project_id}"
     DOCS_UPLOAD_LOCK = "docs_upload_lock:{telegram_id}:{project_id}"
+    SCHEDULER_CLAIM = "scheduler:{job}:{due}"
     FSM_PREFIX = "fsm"
 
     def build(self, **parts: object) -> str:

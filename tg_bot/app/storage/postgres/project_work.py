@@ -29,6 +29,11 @@ class PostgresProjectWork:
     async def get_by_id(self, project_id: int) -> Project | None:
         return await self._client.get_one(Project, id=project_id)
 
+    async def get_many_by_ids(self, project_ids: list[int]) -> list[Project]:
+        if not project_ids:
+            return []
+        return await self._client.get_many(Project, id__in=project_ids, order_by=("id",))
+
     async def get_by_public_id(self, public_id: str) -> Project | None:
         return await self._client.get_one(Project, public_id=public_id)
 

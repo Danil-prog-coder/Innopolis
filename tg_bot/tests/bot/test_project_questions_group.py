@@ -1,5 +1,11 @@
 import pytest
-from aiogram.methods import AnswerCallbackQuery, DeleteMessage, SendMessage, SendPhoto
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    DeleteMessage,
+    SendMessage,
+    SendPhoto,
+    SendRichMessage,
+)
 from aiogram.types import ReplyKeyboardMarkup
 
 from app.bot import texts
@@ -97,12 +103,24 @@ async def test_text_without_project_prompts_join(feed, session):
     assert session.last(SendMessage).text == texts.NO_PROJECT
 
 
-async def test_answer_found(feed, session, fake_llm, user_in_project, project):
+async def test_answer_found_is_rich_markdown(feed, session, fake_llm, user_in_project, project):
+    fake_llm.answer = AskResult(found=True, answer="## Как сохранить\n\n- Нажмите **Сохранить**")
+    message = await feed.message("как сохранить?", from_user=USER_TG)
+    sent = session.last(SendRichMessage)
+    assert sent.rich_message.markdown == "## Как сохранить\n\n- Нажмите **Сохранить**"
+    assert sent.reply_parameters.message_id == message.message_id
+    assert fake_llm.last_project_id == project.id
+
+
+async def test_rejected_rich_answer_falls_back_to_plain_text(
+    feed, session, fake_llm, user_in_project
+):
+    session.failing_methods.add("SendRichMessage")
     fake_llm.answer = AskResult(found=True, answer="Нажмите <Сохранить> & готово")
-    await feed.message("как сохранить?", from_user=USER_TG)
+    message = await feed.message("как сохранить?", from_user=USER_TG)
     sent = session.last(SendMessage)
     assert sent.text == "Нажмите <Сохранить> & готово" and sent.parse_mode is None
-    assert fake_llm.last_project_id == project.id
+    assert sent.reply_parameters.message_id == message.message_id
 
 
 async def test_not_found_goes_to_admins(feed, session, user_in_project, admin, second_admin):
@@ -123,10 +141,19 @@ async def test_very_long_question_fits_admin_message(feed, session, user_in_proj
     assert len(to_admin.text) <= 4096
 
 
-async def test_long_answer_is_split(feed, session, fake_llm, user_in_project):
+async def test_long_answer_is_one_rich_message(feed, session, fake_llm, user_in_project):
     fake_llm.answer = AskResult(found=True, answer="a" * 9000)
     await feed.message("q", from_user=USER_TG)
-    assert [len(m.text) for m in session.all(SendMessage)][-3:] == [4096, 4096, 808]
+    assert len(session.last(SendRichMessage).rich_message.markdown) == 9000
+
+
+async def test_too_long_answer_is_split_as_plain_text(feed, session, fake_llm, user_in_project):
+    fake_llm.answer = AskResult(found=True, answer="a" * (texts.TELEGRAM_RICH_MESSAGE_LIMIT + 1))
+    await feed.message("q", from_user=USER_TG)
+    assert session.all(SendRichMessage) == []
+    parts = [m for m in session.all(SendMessage) if m.chat_id == USER_TG.id]
+    assert [len(m.text) for m in parts][-9:] == [4096] * 8 + [1]
+    assert parts[-9].reply_parameters is not None and parts[-1].reply_parameters is None
 
 
 async def test_llm_down_message(feed, session, fake_llm, user_in_project):
@@ -169,7 +196,7 @@ async def test_screenshot_as_image_document(feed, session, user_in_project, fake
         "file_size": 1000,
     }
     await feed.message(document=doc, from_user=USER_TG)
-    assert session.last(SendMessage).text == "ответ"
+    assert session.last(SendRichMessage).rich_message.markdown == "ответ"
 
 
 async def test_unknown_command_is_not_a_question(feed, session, fake_llm, user_in_project):
@@ -191,18 +218,32 @@ async def test_admin_answer_reaches_asker_and_saves_knowledge(
     question = await _ask_unanswered(feed)
     await feed.callback(AnswerQuestionCb(question_id=question.id).pack(), from_user=ADMIN_TG)
     assert session.last(SendMessage).text == texts.ASK_ANSWER
-    await feed.message("вот <ответ>", from_user=ADMIN_TG)
+    await feed.message("вот <ответ>\nвторая строка", from_user=ADMIN_TG)
 
-    delivered = next(
-        m for m in session.all(SendMessage) if m.chat_id == USER_TG.id and "вот <ответ>" in m.text
+    delivered = session.last(SendRichMessage)
+    assert delivered.chat_id == USER_TG.id
+    assert delivered.rich_message.html == (
+        "<p><b>Ответ админа на ваш вопрос</b></p><blockquote>вопрос X</blockquote>"
+        "<p>вот &lt;ответ&gt;</p><p>вторая строка</p>"
     )
-    assert delivered.parse_mode is None
     assert delivered.reply_parameters.message_id == question.message_id
     assert session.last(SendMessage).text == texts.ANSWER_SENT
 
     await feed.callback(SaveKnowledgeCb(question_id=question.id).pack(), from_user=ADMIN_TG)
     assert session.last(AnswerCallbackQuery).text == texts.KNOWLEDGE_SAVED
-    assert fake_llm.knowledge == [(project.id, "вопрос X", "вот <ответ>")]
+    assert fake_llm.knowledge == [(project.id, "вопрос X", "вот <ответ>\nвторая строка")]
+
+
+async def test_admin_answer_falls_back_to_plain_text(feed, session, user_in_project):
+    question = await _ask_unanswered(feed)
+    session.failing_methods.add("SendRichMessage")
+    await feed.callback(AnswerQuestionCb(question_id=question.id).pack(), from_user=ADMIN_TG)
+    await feed.message("вот <ответ>", from_user=ADMIN_TG)
+    delivered = [m for m in session.all(SendMessage) if m.chat_id == USER_TG.id][-1]
+    assert delivered.text == texts.answer_to_asker("вопрос X", "вот <ответ>")
+    assert delivered.parse_mode is None
+    assert delivered.reply_parameters.message_id == question.message_id
+    assert session.last(SendMessage).text == texts.ANSWER_SENT
 
 
 async def test_second_admin_sees_already_answered(feed, session, user_in_project):
@@ -226,13 +267,13 @@ async def test_user_cannot_press_answer(feed, session, user_in_project):
 
 
 async def test_changes_button(feed, session, docs_service, project, admin, fake_llm):
-    fake_llm.summary = "Добавлен раздел <API>"
+    fake_llm.summary = "- Добавлен раздел **API**"
     update = await docs_service.apply_update(
         admin, project.id, DocsMode.APPEND, [DocFile("a", b"")]
     )
     await feed.callback(ChangesCb(update_id=update.id).pack(), from_user=USER_TG)
-    sent = session.last(SendMessage)
-    assert sent.text == "Добавлен раздел <API>" and sent.parse_mode is None
+    sent = session.last(SendRichMessage)
+    assert sent.rich_message.markdown == "- Добавлен раздел **API**"
     await feed.callback(ChangesCb(update_id=update.id).pack(), from_user=OUTSIDER_TG)
     assert session.last(AnswerCallbackQuery).text == texts.NOT_MEMBER
 
@@ -306,7 +347,8 @@ async def test_group_not_found_and_admin_answer_goes_to_group(feed, session, pro
     assert question.chat_id == GROUP
     await feed.callback(AnswerQuestionCb(question_id=question.id).pack(), from_user=ADMIN_TG)
     await feed.message("в /var/log", from_user=ADMIN_TG)
-    assert any(m.chat_id == GROUP and "в /var/log" in m.text for m in session.all(SendMessage))
+    delivered = session.last(SendRichMessage)
+    assert delivered.chat_id == GROUP and "<p>в /var/log</p>" in delivered.rich_message.html
 
 
 async def test_empty_ask(feed, session, project_password):

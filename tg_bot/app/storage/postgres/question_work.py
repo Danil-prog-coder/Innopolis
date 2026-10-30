@@ -31,6 +31,15 @@ class PostgresQuestionWork:
     async def get_by_id(self, question_id: int) -> Question | None:
         return await self._client.get_one(Question, id=question_id)
 
+    async def get_created_between(self, since: datetime, until: datetime) -> list[Question]:
+        """Вопросы, заданные в [since, until), новые первыми."""
+        return await self._client.get_many(
+            Question,
+            created_at__gte=since,
+            created_at__lt=until,
+            order_by=("-created_at", "-id"),
+        )
+
     async def mark_answered(
         self, question_id: int, admin_user_id: int, answer: str, now: datetime
     ) -> bool:

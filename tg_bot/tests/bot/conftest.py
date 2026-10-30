@@ -41,7 +41,13 @@ OUTSIDER_TG = TgUser(id=1004, is_bot=False, first_name="Outsider", username="out
 FRESH_TG = TgUser(id=2001, is_bot=False, first_name="Fresh")
 BOT_TG = TgUser(id=BOT_ID, is_bot=True, first_name="Bot", username=BOT_USERNAME)
 
-_MESSAGE_RETURNING = {"SendMessage", "SendPhoto", "EditMessageText", "SendDocument"}
+_MESSAGE_RETURNING = {
+    "SendMessage",
+    "SendRichMessage",
+    "SendPhoto",
+    "EditMessageText",
+    "SendDocument",
+}
 
 
 class MockedSession(BaseSession):

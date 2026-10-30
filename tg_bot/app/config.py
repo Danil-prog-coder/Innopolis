@@ -1,6 +1,7 @@
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,7 +29,22 @@ class Settings(BaseSettings):
     password_reveal_ttl_seconds: int = 600
     docs_max_files: int = 10
 
+    # Часовой пояс расписания заданий (IANA, например Europe/Moscow)
+    scheduler_timezone: str = "Europe/Moscow"
+    # Еженедельная сводка админам: день недели (0 — понедельник) и час
+    digest_weekday: int = Field(default=0, ge=0, le=6)
+    digest_hour: int = Field(default=10, ge=0, le=23)
+
     log_level: str = "INFO"
+
+    @field_validator("scheduler_timezone")
+    @classmethod
+    def _check_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError(f"Unknown timezone {value!r}") from error
+        return value
 
     @property
     def postgres_dsn(self) -> str:
