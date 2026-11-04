@@ -29,6 +29,17 @@ class Settings(BaseSettings):
     password_reveal_ttl_seconds: int = 600
     docs_max_files: int = 10
 
+    # Постепенный показ ответа: черновик в личке, редактируемая заглушка в группе.
+    # False — как раньше: «печатает…», затем ответ целиком
+    answer_streaming_enabled: bool = True
+    # За сколько секунд «допечатывается» готовый ответ (0 — без анимации, только «думаю…»)
+    answer_stream_replay_seconds: float = Field(default=1.5, ge=0, le=10)
+    # Пауза между кадрами: черновик в личке и редактирование сообщения в группе
+    answer_stream_draft_interval_seconds: float = Field(default=0.3, gt=0)
+    answer_stream_edit_interval_seconds: float = Field(default=1.0, gt=0)
+    # Черновик Telegram гаснет через 30 секунд — пока ИИ думает, обновляем его чаще
+    answer_stream_keepalive_seconds: float = Field(default=20, gt=0, lt=30)
+
     # Часовой пояс расписания заданий (IANA, например Europe/Moscow)
     scheduler_timezone: str = "Europe/Moscow"
     # Еженедельная сводка админам: день недели (0 — понедельник) и час
