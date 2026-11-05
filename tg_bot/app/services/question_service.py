@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 
 from app.config import Settings
@@ -12,7 +13,14 @@ from app.core.errors import (
     QuestionTooLong,
     RateLimited,
 )
-from app.llm.gateway import AskResult, LLMGateway
+from app.llm.gateway import (
+    AskResult,
+    KnowledgeSnapshot,
+    LLMContractError,
+    LLMGateway,
+    NoAnswerReason,
+    Source,
+)
 from app.services.access_service import AccessGuard
 from app.storage.postgres.membership_work import PostgresMembershipWork
 from app.storage.postgres.models import Project, Question, User
@@ -22,6 +30,8 @@ from app.storage.redis.answer_cache_work import RedisAnswerCacheWork
 from app.storage.redis.rate_limit_work import RedisRateLimitWork
 
 SCREENSHOT_PLACEHOLDER = "[скриншот]"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +49,9 @@ class AskOutcome:
 
     answer: str | None = None
     question: Question | None = None
+    sources: tuple[Source, ...] = ()
+    snapshot: KnowledgeSnapshot | None = None
+    no_answer_reason: NoAnswerReason | None = None
 
 
 class QuestionService:
@@ -73,16 +86,35 @@ class QuestionService:
         text = self._validate(text)
         await self._check_rate(scope, asker)
         project = await self._get_project(project_id)
+        # Snapshot фиксируется до retrieval и не перечитывается после ответа.
+        snapshot = KnowledgeSnapshot.compat(project.id, project.docs_version)
 
-        cached = await self._cache.get(project.id, project.docs_version, text)
+        cached = await self._cache.get(project.id, snapshot.knowledge_version, text)
         if cached is not None:
-            return AskOutcome(answer=cached)
+            cached_result = self._cached_result(cached, snapshot)
+            if cached_result is not None:
+                return AskOutcome(
+                    answer=cached_result.answer,
+                    sources=cached_result.sources,
+                    snapshot=snapshot,
+                )
 
-        result = await self._llm.ask(project.id, text)
-        if answer := self._answer_of(result):
-            await self._cache.set(project.id, project.docs_version, text, answer)
-            return AskOutcome(answer=answer)
-        return AskOutcome(question=await self._save_question(project.id, text, asker, None))
+        result = await self._llm.ask(project.id, text, snapshot=snapshot)
+        result = self._checked_result(result, snapshot)
+        if result.found:
+            await self._cache.set(
+                project.id, snapshot.knowledge_version, text, result.to_cache_json()
+            )
+            return AskOutcome(
+                answer=result.answer,
+                sources=result.sources,
+                snapshot=snapshot,
+            )
+        return AskOutcome(
+            question=await self._save_question(project.id, text, asker, None),
+            snapshot=snapshot,
+            no_answer_reason=result.no_answer_reason,
+        )
 
     async def ask_image(
         self,
@@ -97,13 +129,21 @@ class QuestionService:
             raise QuestionTooLong
         await self._check_rate(RateLimitScope.QUESTION, asker)
         project = await self._get_project(project_id)
+        snapshot = KnowledgeSnapshot.compat(project.id, project.docs_version)
 
-        result = await self._llm.ask_image(project.id, image, caption)
-        if answer := self._answer_of(result):
-            return AskOutcome(answer=answer)
+        result = await self._llm.ask_image(project.id, image, caption, snapshot=snapshot)
+        result = self._checked_result(result, snapshot)
+        if result.found:
+            return AskOutcome(
+                answer=result.answer,
+                sources=result.sources,
+                snapshot=snapshot,
+            )
         text = caption or SCREENSHOT_PLACEHOLDER
         return AskOutcome(
-            question=await self._save_question(project.id, text, asker, image_file_id)
+            question=await self._save_question(project.id, text, asker, image_file_id),
+            snapshot=snapshot,
+            no_answer_reason=result.no_answer_reason,
         )
 
     async def get_admin_chat_ids(self, project_id: int) -> list[int]:
@@ -164,10 +204,49 @@ class QuestionService:
         return project
 
     @staticmethod
-    def _answer_of(result: AskResult) -> str | None:
-        if result.found and result.answer and result.answer.strip():
-            return result.answer.strip()
-        return None
+    def _cached_result(raw: str, snapshot: KnowledgeSnapshot) -> AskResult | None:
+        """Принять только полный ответ той же версии; иначе — miss."""
+        try:
+            cached = AskResult.from_json(raw)
+        except (TypeError, ValueError, KeyError) as error:
+            logger.warning("Ignoring invalid answer cache: %s", error)
+            return None
+        if not cached.found or not cached.sources:
+            return None
+        if cached.usage is not None or cached.request_id is not None:
+            # Cache не должен нести историческую попытку/стоимость.
+            return None
+        if cached.snapshot != snapshot:
+            return None
+        for source in cached.sources:
+            if (
+                source.project_id != snapshot.project_id
+                or source.generation_id != snapshot.generation_id
+                or source.knowledge_version != snapshot.knowledge_version
+            ):
+                return None
+        return cached
+
+    @staticmethod
+    def _checked_result(result: AskResult, snapshot: KnowledgeSnapshot) -> AskResult:
+        """Проверить scope. Ошибка provenance не превращается в no-answer."""
+        if not isinstance(result, AskResult):
+            raise LLMContractError("gateway returned invalid AskResult")
+        if result.snapshot is None:
+            raise LLMContractError("gateway result has no snapshot")
+        if result.snapshot != snapshot:
+            raise LLMContractError("gateway returned result for a different snapshot")
+        if result.found:
+            if not result.sources:
+                raise LLMContractError("found=True requires verified sources")
+            for source in result.sources:
+                if (
+                    source.project_id != snapshot.project_id
+                    or source.generation_id != snapshot.generation_id
+                    or source.knowledge_version != snapshot.knowledge_version
+                ):
+                    raise LLMContractError("source does not belong to snapshot")
+        return result
 
     async def _save_question(
         self, project_id: int, text: str, asker: Asker, image_file_id: str | None

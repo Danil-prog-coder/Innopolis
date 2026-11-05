@@ -41,12 +41,19 @@ async def deliver_outcome(
     """Ответ — автору в тот же чат; нет ответа — сообщить автору и передать вопрос админам."""
     if outcome.answer is not None:
         reply = ReplyParameters(message_id=message.message_id, allow_sending_without_reply=True)
-        # Ответ ИИ — в Markdown: заголовки, списки, таблицы и код Telegram покажет как есть
+        # Источники форматирует сервер; ответ ИИ — Markdown для Rich Message.
+        text = views.with_sources(outcome.answer, outcome.sources)
+        rich = InputRichMessage(
+            markdown=text,
+            # Метаданные источников недоверенные: не даём автоссылкам/упоминаниям
+            # исполняться из title/section_path.
+            skip_entity_detection=bool(outcome.sources),
+        )
         await views.send_rich(
             message.bot,
             message.chat.id,
-            InputRichMessage(markdown=outcome.answer),
-            fallback=outcome.answer,
+            rich,
+            fallback=text,
             reply_parameters=reply,
         )
         return

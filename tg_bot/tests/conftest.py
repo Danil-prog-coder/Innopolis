@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 
 import pytest
 from fakeredis import FakeAsyncRedis
@@ -7,7 +8,7 @@ from tortoise import Tortoise
 from app.config import Settings
 from app.core.enums import DocsMode, MemberRole
 from app.core.security import ProjectPasswordManager
-from app.llm.gateway import AskResult, LLMGateway, LLMUnavailableError
+from app.llm.gateway import AskResult, LLMGateway, LLMUnavailableError, Source
 from app.services.access_service import AccessGuard
 from app.services.docs_service import DocsService
 from app.services.group_chat_service import GroupChatService
@@ -280,6 +281,7 @@ class FakeLLMGateway(LLMGateway):
         self.ask_calls = 0
         self.last_project_id: int | None = None
         self.last_question: str | None = None
+        self.last_snapshot: object | None = None
         self.uploads: list[tuple[int, DocsMode, list[str]]] = []
         self.knowledge: list[tuple[int, str, str]] = []
 
@@ -287,16 +289,44 @@ class FakeLLMGateway(LLMGateway):
         if self.fail:
             raise LLMUnavailableError
 
-    async def ask(self, project_id, question):
+    def _with_scope(self, result: AskResult, snapshot):
+        # Тестовый/legacy adapter: real RAG обязан вернуть проверенные sources.
+        if result.found and not result.sources:
+            if snapshot is None:
+                return result
+            source = Source(
+                project_id=snapshot.project_id,
+                generation_id=snapshot.generation_id,
+                knowledge_version=snapshot.knowledge_version,
+                document_id="test-document",
+                document_version="1",
+                chunk_id="test-chunk",
+                title="test",
+                excerpt="test",
+                citation_label="[1]",
+            )
+            result = replace(
+                result,
+                sources=(source,),
+                snapshot=snapshot,
+                legacy_no_sources=False,
+            )
+        elif snapshot is not None and result.snapshot is None:
+            result = replace(result, snapshot=snapshot)
+        return result
+
+    async def ask(self, project_id, question, *, snapshot=None):
         self._check()
         self.ask_calls += 1
         self.last_project_id, self.last_question = project_id, question
-        return self.answer
+        self.last_snapshot = snapshot
+        return self._with_scope(self.answer, snapshot)
 
-    async def ask_image(self, project_id, image, caption):
+    async def ask_image(self, project_id, image, caption, *, snapshot=None):
         self._check()
         self.last_project_id, self.last_question = project_id, caption
-        return self.answer
+        self.last_snapshot = snapshot
+        return self._with_scope(self.answer, snapshot)
 
     async def upload_documents(self, project_id, mode, files):
         self._check()

@@ -13,7 +13,8 @@ class TableName(StrEnum):
 
 
 class RedisKey(StrEnum):
-    ANSWER_CACHE = "cache:answer:{project_id}:{docs_version}:{question_hash}"
+    # PERS-42: новый namespace. Старые cache:answer:* не читаются.
+    ANSWER_CACHE = "cache:answer:v1:{project_id}:{knowledge_version}:{question_hash}"
     RATE_LIMIT = "ratelimit:{scope}:{subject_id}"
     PASSWORD_REVEAL = "password_reveal:{project_id}"
     DOCS_DRAFT = "docs_draft:{telegram_id}:{project_id}"

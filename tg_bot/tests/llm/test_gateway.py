@@ -1,13 +1,20 @@
 import pytest
 
 from app.core.enums import DocsMode
-from app.llm.gateway import AskResult, DocFile, LLMGateway, StubLLMGateway
+from app.llm.gateway import (
+    AskResult,
+    DocFile,
+    LLMGateway,
+    NoAnswerReason,
+    StubLLMGateway,
+)
 
 
 async def test_stub_never_answers():
     gateway = StubLLMGateway()
-    assert await gateway.ask(1, "q") == AskResult(found=False, answer=None)
-    assert await gateway.ask_image(1, b"img", None) == AskResult(found=False, answer=None)
+    expected = AskResult(found=False, answer=None, no_answer_reason=NoAnswerReason.NO_EVIDENCE)
+    assert await gateway.ask(1, "q") == expected
+    assert await gateway.ask_image(1, b"img", None) == expected
 
 
 @pytest.mark.parametrize(

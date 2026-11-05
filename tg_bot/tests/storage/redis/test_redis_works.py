@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 
 import pytest
 
@@ -21,16 +22,49 @@ async def test_client_not_connected_raises():
         _ = RedisClient("redis://localhost").redis
 
 
-async def test_cache_normalizes_question(answer_cache_work):
-    await answer_cache_work.set(1, 0, "  Как  ДЕЛА? ", "ok")
-    assert await answer_cache_work.get(1, 0, "как дела?") == "ok"
-    assert await answer_cache_work.get(1, 1, "как дела?") is None  # новая версия документации
-    assert await answer_cache_work.get(2, 0, "как дела?") is None  # другой проект
+async def test_cache_is_exact_and_version_scoped(answer_cache_work):
+    await answer_cache_work.set(1, 0, "q", "ok")
+    assert await answer_cache_work.get(1, 0, "q") == "ok"
+    # Ключ exact: регистр и границы значимы (trim делает QuestionService).
+    assert await answer_cache_work.get(1, 0, "Q") is None
+    assert await answer_cache_work.get(1, 0, "q ") is None
+    assert await answer_cache_work.get(1, 1, "q") is None  # другая версия
+    assert await answer_cache_work.get(2, 0, "q") is None  # другой проект
+
+
+async def test_cache_distinguishes_numbers_negations_and_case(answer_cache_work):
+    cases = {"не 5": "a", "не 6": "b", "5": "c", "User": "d", "user": "e"}
+    for question, value in cases.items():
+        await answer_cache_work.set(1, 0, question, value)
+
+    for question, value in cases.items():
+        assert await answer_cache_work.get(1, 0, question) == value
+    assert await answer_cache_work.get(1, 0, "не") is None
+
+
+async def test_cache_distinguishes_code_indentation_and_literals(answer_cache_work):
+    four_spaces = "```python\nif x:\n    print('a')\n```"
+    two_spaces = "```python\nif x:\n  print('a')\n```"
+    other_literal = "```python\nif x:\n    print('b')\n```"
+
+    await answer_cache_work.set(1, 0, four_spaces, "a")
+
+    assert await answer_cache_work.get(1, 0, four_spaces) == "a"
+    assert await answer_cache_work.get(1, 0, two_spaces) is None
+    assert await answer_cache_work.get(1, 0, other_literal) is None
+
+
+async def test_legacy_cache_namespace_is_not_read(answer_cache_work, redis_client):
+    question_hash = hashlib.sha256(b"q").hexdigest()
+    legacy_key = f"cache:answer:1:0:{question_hash}"
+    await redis_client.set(legacy_key, "legacy", ttl_seconds=60)
+
+    assert await answer_cache_work.get(1, 0, "q") is None
 
 
 async def test_cache_has_ttl(answer_cache_work, redis_client):
     await answer_cache_work.set(1, 0, "q", "a")
-    keys = await redis_client.redis.keys("cache:answer:1:0:*")
+    keys = await redis_client.redis.keys("cache:answer:v1:1:0:*")
     assert len(keys) == 1
     assert 0 < await redis_client.redis.ttl(keys[0]) <= 60
 

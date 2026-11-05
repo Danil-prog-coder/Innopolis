@@ -24,7 +24,7 @@ from app.llm.gateway import AskResult, DocFile
 from app.storage.postgres.models import GroupChat, Question
 from tests.bot.conftest import ADMIN_TG, FRESH_TG, OUTSIDER_TG, SECOND_ADMIN_TG, USER_TG
 
-FOUND = AskResult(found=True, answer="ответ")
+FOUND = AskResult(found=True, answer="ответ", legacy_no_sources=True)
 
 
 @pytest.fixture
@@ -104,10 +104,13 @@ async def test_text_without_project_prompts_join(feed, session):
 
 
 async def test_answer_found_is_rich_markdown(feed, session, fake_llm, user_in_project, project):
-    fake_llm.answer = AskResult(found=True, answer="## Как сохранить\n\n- Нажмите **Сохранить**")
+    fake_llm.answer = AskResult(
+        found=True, answer="## Как сохранить\n\n- Нажмите **Сохранить**", legacy_no_sources=True
+    )
     message = await feed.message("как сохранить?", from_user=USER_TG)
     sent = session.last(SendRichMessage)
-    assert sent.rich_message.markdown == "## Как сохранить\n\n- Нажмите **Сохранить**"
+    assert sent.rich_message.markdown.startswith("## Как сохранить\n\n- Нажмите **Сохранить**")
+    assert "**Источники:**" in sent.rich_message.markdown
     assert sent.reply_parameters.message_id == message.message_id
     assert fake_llm.last_project_id == project.id
 
@@ -116,10 +119,13 @@ async def test_rejected_rich_answer_falls_back_to_plain_text(
     feed, session, fake_llm, user_in_project
 ):
     session.failing_methods.add("SendRichMessage")
-    fake_llm.answer = AskResult(found=True, answer="Нажмите <Сохранить> & готово")
+    fake_llm.answer = AskResult(
+        found=True, answer="Нажмите <Сохранить> & готово", legacy_no_sources=True
+    )
     message = await feed.message("как сохранить?", from_user=USER_TG)
     sent = session.last(SendMessage)
-    assert sent.text == "Нажмите <Сохранить> & готово" and sent.parse_mode is None
+    assert sent.text.startswith("Нажмите <Сохранить> & готово")
+    assert sent.parse_mode is None
     assert sent.reply_parameters.message_id == message.message_id
 
 
@@ -142,18 +148,26 @@ async def test_very_long_question_fits_admin_message(feed, session, user_in_proj
 
 
 async def test_long_answer_is_one_rich_message(feed, session, fake_llm, user_in_project):
-    fake_llm.answer = AskResult(found=True, answer="a" * 9000)
+    fake_llm.answer = AskResult(found=True, answer="a" * 9000, legacy_no_sources=True)
     await feed.message("q", from_user=USER_TG)
-    assert len(session.last(SendRichMessage).rich_message.markdown) == 9000
+    markdown = session.last(SendRichMessage).rich_message.markdown
+    assert markdown.startswith("a" * 9000)
+    assert "**Источники:**" in markdown
 
 
 async def test_too_long_answer_is_split_as_plain_text(feed, session, fake_llm, user_in_project):
-    fake_llm.answer = AskResult(found=True, answer="a" * (texts.TELEGRAM_RICH_MESSAGE_LIMIT + 1))
+    fake_llm.answer = AskResult(
+        found=True, answer="a" * (texts.TELEGRAM_RICH_MESSAGE_LIMIT + 1), legacy_no_sources=True
+    )
     await feed.message("q", from_user=USER_TG)
     assert session.all(SendRichMessage) == []
     parts = [m for m in session.all(SendMessage) if m.chat_id == USER_TG.id]
-    assert [len(m.text) for m in parts][-9:] == [4096] * 8 + [1]
-    assert parts[-9].reply_parameters is not None and parts[-1].reply_parameters is None
+    assert all(len(m.text) <= 4096 for m in parts)
+    joined = "".join(m.text for m in parts)
+    assert joined.startswith("a" * (texts.TELEGRAM_RICH_MESSAGE_LIMIT + 1))
+    assert "**Источники:**" in parts[-1].text
+    assert parts[0].reply_parameters is not None
+    assert all(m.reply_parameters is None for m in parts[1:])
 
 
 async def test_llm_down_message(feed, session, fake_llm, user_in_project):
@@ -196,7 +210,7 @@ async def test_screenshot_as_image_document(feed, session, user_in_project, fake
         "file_size": 1000,
     }
     await feed.message(document=doc, from_user=USER_TG)
-    assert session.last(SendRichMessage).rich_message.markdown == "ответ"
+    assert session.last(SendRichMessage).rich_message.markdown.startswith("ответ")
 
 
 async def test_unknown_command_is_not_a_question(feed, session, fake_llm, user_in_project):
