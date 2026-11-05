@@ -49,6 +49,10 @@ def settings():
         password_attempts_limit=5,
         question_rate_limit=10,
         docs_max_files=10,
+        # Анимация ответа включена, но быстрая — тесты не ждут по полторы секунды
+        answer_stream_replay_seconds=0.03,
+        answer_stream_draft_interval_seconds=0.01,
+        answer_stream_edit_interval_seconds=0.01,
     )
 
 

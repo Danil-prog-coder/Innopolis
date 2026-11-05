@@ -9,6 +9,7 @@ from aiogram.types import ErrorEvent
 from app.bot import texts
 from app.bot.middlewares import UserMiddleware
 from app.bot.routers import setup_routers
+from app.bot.streaming import GenerationRegistry
 from app.core.depends import DependsMiddleware, DependsResolver
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,9 @@ def build_dispatcher(
 ) -> Dispatcher:
     """``catch_errors=False`` — для тестов: исключение хендлера роняет тест, а не прячется."""
     dp = Dispatcher(storage=storage)
+    # Попадает в хендлеры аргументом generation_registry: вопрос регистрирует генерацию,
+    # кнопка «Стоп» её отменяет
+    dp["generation_registry"] = GenerationRegistry()
     user_middleware = UserMiddleware(resolver)
     depends_middleware = DependsMiddleware(resolver)
     for observer in (dp.message, dp.callback_query):

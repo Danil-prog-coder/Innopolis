@@ -145,6 +145,8 @@ GROUP_ANSWERS_UNAVAILABLE = (
 ANSWER_STOPPED = "Ответ остановлен."
 NOTHING_TO_STOP = "Нет активного ответа."
 ANSWER_IN_PROGRESS = "Уже формирую ответ в этой теме. Дождитесь его или отправьте /stop."
+ANSWER_PLACEHOLDER = "⏳ Ищу ответ в документации…"
+GENERATION_STOPPED = "Остановил ответ. Задайте вопрос ещё раз, если он нужен."
 QUESTION_TOO_LONG = "Слишком длинный текст — сократите его до 4000 символов."
 EMPTY_TEXT = "Пустое сообщение — напишите текст."
 

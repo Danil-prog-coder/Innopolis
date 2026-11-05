@@ -33,11 +33,30 @@ from app.llm.gateway import (
     AskEventType,
     AskResult,
     DocFile,
+    KnowledgeSnapshot,
 )
 from app.storage.postgres.models import GroupChat, Question
 from tests.bot.conftest import ADMIN_TG, FRESH_TG, OUTSIDER_TG, SECOND_ADMIN_TG, USER_TG
 
 FOUND = AskResult(found=True, answer="ответ", legacy_no_sources=True)
+
+
+class FixedSnapshots:
+    def __init__(self, project_id: int) -> None:
+        self.project_id = project_id
+
+    async def get(self, project_id: int):
+        assert project_id == self.project_id
+        return KnowledgeSnapshot(project_id, "test-gen", 1)
+
+
+def enable_real_mode(resolver, settings, project_id: int) -> None:
+    resolver.overrides[dependencies.get_obj_settings] = lambda: settings.model_copy(
+        update={"rag_mode": "real"}
+    )
+    resolver.overrides[dependencies.get_obj_published_snapshots] = lambda: FixedSnapshots(
+        project_id
+    )
 
 
 class WaitingStreamingLLM:
@@ -229,7 +248,10 @@ async def test_stop_command_from_foreign_user_is_noop(feed, session):
         registry.unregister(registration)
 
 
-async def test_second_question_in_same_thread_is_rejected(feed, session, fake_llm, user_in_project):
+async def test_second_question_in_same_thread_is_rejected(
+    feed, session, fake_llm, resolver, settings, project, user_in_project
+):
+    enable_real_mode(resolver, settings, project.id)
     registry = get_obj_active_draft_registry()
     registration = registry.register(
         chat_id=USER_TG.id,
@@ -244,7 +266,10 @@ async def test_second_question_in_same_thread_is_rejected(feed, session, fake_ll
         registry.unregister(registration)
 
 
-async def test_question_in_independent_thread_is_allowed(feed, session, fake_llm, user_in_project):
+async def test_question_in_independent_thread_is_allowed(
+    feed, session, fake_llm, resolver, settings, project, user_in_project
+):
+    enable_real_mode(resolver, settings, project.id)
     registry = get_obj_active_draft_registry()
     registration = registry.register(
         chat_id=USER_TG.id,
@@ -305,8 +330,9 @@ async def test_stopped_generation_from_foreign_chat_cannot_stop(dp, bot):
 
 
 async def test_stop_update_aborts_streaming_final(
-    feed, session, dp, bot, resolver, user_in_project
+    feed, session, dp, bot, resolver, settings, project, user_in_project
 ):
+    enable_real_mode(resolver, settings, project.id)
     resolver.overrides[dependencies.get_obj_llm_gateway] = lambda: WaitingStreamingLLM()
     task = asyncio.create_task(feed.message("q", from_user=USER_TG))
     try:
@@ -335,7 +361,10 @@ async def test_stop_update_aborts_streaming_final(
     assert session.all(SendRichMessage) == []
 
 
-async def test_permission_rich_error_does_not_fall_back(feed, session, fake_llm, user_in_project):
+async def test_permission_rich_error_does_not_fall_back(
+    feed, session, fake_llm, resolver, settings, project, user_in_project
+):
+    enable_real_mode(resolver, settings, project.id)
     session.failing_methods.add("SendRichMessage")
     session.failing_message = "not enough rights to send messages"
     fake_llm.answer = AskResult(found=True, answer="ответ", legacy_no_sources=True)

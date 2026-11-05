@@ -113,6 +113,14 @@ endpoint ещё не выбран. Реальные capabilities проверя�
 Private-chat streaming подключён к question router. Group streaming не включён:
 real-mode группы fail-closed до INN-10.
 
+Совместимость с PR #2: в `stub`/final-only режиме сохранён replay-слой
+`app/bot/streaming.py` (черновик с кадрами, групповая заглушка). В
+`RAG_MODE=real` используется true event-stream (`QuestionService.ask_text_stream`
+→ `TelegramStreamDelivery`). Это два взаимоисключающих пути, дублирующих
+сообщений нет. Stop-handler обслуживает оба реестра: `GenerationRegistry` для
+replay-задач и `ActiveDraftRegistry` для true-stream draft. `/stop` ограничен
+chat+thread+actor в обоих случаях.
+
 - Private chat: stable draft id, throttle/coalesce, preliminary marker, URL
   defang, `skip_entity_detection`.
 - Final отправляется один раз; no-answer final не отправляется пустым

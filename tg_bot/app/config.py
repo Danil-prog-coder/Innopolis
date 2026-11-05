@@ -30,8 +30,15 @@ class Settings(BaseSettings):
     password_reveal_ttl_seconds: int = 600
     docs_max_files: int = 10
 
-    # stub — явный dev/test режим без публикации. real требует полный provider
-    # config и published generation; при нехватке конфигурации startup fail-closed.
+    # Постепенный показ ответа (PR #2 replay path для stub/final-only gateway).
+    answer_streaming_enabled: bool = True
+    answer_stream_replay_seconds: float = Field(default=1.5, ge=0, le=10)
+    answer_stream_draft_interval_seconds: float = Field(default=0.3, gt=0)
+    answer_stream_edit_interval_seconds: float = Field(default=1.0, gt=0)
+    answer_stream_keepalive_seconds: float = Field(default=20, gt=0, lt=30)
+
+    # Real RAG: stub — dev/test без публикации; real требует provider config и
+    # published generation, иначе startup fail-closed.
     rag_mode: Literal["stub", "real"] = "stub"
     rag_qdrant_path: str = "data/qdrant"
     rag_qdrant_url: str = ""

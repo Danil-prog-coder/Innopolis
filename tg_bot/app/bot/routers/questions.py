@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from collections.abc import Awaitable
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction, ChatType
@@ -14,8 +15,10 @@ from aiogram.types import (
     ReplyParameters,
 )
 
-from app.bot import keyboards, texts, views
+from app.bot import keyboards, streaming, texts, views
 from app.bot.notifier import Notifier
+from app.bot.streaming import AskCall, GenerationRegistry, StreamTiming
+from app.config import Settings
 from app.core.depends import Depends
 from app.core.enums import RateLimitScope
 from app.core.errors import DomainError, FileTooLarge
@@ -24,6 +27,7 @@ from app.dependencies import (
     get_obj_notifier,
     get_obj_project_service,
     get_obj_question_service,
+    get_obj_settings,
 )
 from app.llm.gateway import AskEventType, AskResult, LLMUnavailableError
 from app.llm.telegram_stream import TelegramStreamDelivery
@@ -92,31 +96,23 @@ def _stream_fallback(result: AskResult) -> str:
     return views.with_sources(result.answer or "", result.sources)
 
 
-async def stop_generation(
-    event: MessageGenerationStopped,
-    draft_registry: ActiveDraftRegistry = Depends(get_obj_active_draft_registry),
-) -> None:
-    # Streaming drafts are private-only. In a private chat Telegram's chat id is
-    # the user id, so this binds stop to chat + thread + actor instead of a bare
-    # draft id. Group answers are fail-closed in real mode (INN-10).
-    draft_registry.stop(
-        chat_id=event.chat.id,
-        message_thread_id=event.message_thread_id,
-        draft_id=event.draft_id,
-        actor_user_id=event.chat.id,
-    )
-
-
 async def stop_command(
     message: Message,
     db_user: User,
+    generation_registry: GenerationRegistry,
     draft_registry: ActiveDraftRegistry = Depends(get_obj_active_draft_registry),
 ) -> None:
-    if draft_registry.stop_context(
+    stopped_replay = generation_registry.stop_context(
+        chat_id=message.chat.id,
+        thread_id=message.message_thread_id,
+        actor_user_id=db_user.telegram_id,
+    )
+    stopped_stream = draft_registry.stop_context(
         chat_id=message.chat.id,
         message_thread_id=message.message_thread_id,
         actor_user_id=db_user.telegram_id,
-    ):
+    )
+    if stopped_replay or stopped_stream:
         await message.answer(texts.ANSWER_STOPPED)
     else:
         await message.answer(texts.NOTHING_TO_STOP)
@@ -132,32 +128,54 @@ async def _current_project(
     return current.project
 
 
-async def text_question(
+async def ask_private(
     message: Message,
     bot: Bot,
-    db_user: User,
-    project_service: ProjectService = Depends(get_obj_project_service),
-    question_service: QuestionService = Depends(get_obj_question_service),
-    notifier: Notifier = Depends(get_obj_notifier),
-    draft_registry: ActiveDraftRegistry = Depends(get_obj_active_draft_registry),
+    ask: AskCall,
+    settings: Settings,
+    registry: GenerationRegistry,
+) -> AskOutcome | None:
+    """PR #2 replay path for stub/final-only gateways. ``None`` — stop pressed."""
+    if not settings.answer_streaming_enabled:
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        return await ask()
+    preview = streaming.PrivateDraftPreview(
+        bot, message.chat.id, message.message_id, message.message_thread_id
+    )
+    return await streaming.stream_answer(
+        preview,
+        ask,
+        StreamTiming.private(settings),
+        registry,
+        stop_key=(message.chat.id, message.message_id),
+        stop_meta=(
+            message.message_thread_id,
+            message.from_user.id if message.from_user is not None else None,
+        ),
+    )
+
+
+async def _ask_private_realtime(
+    message: Message,
+    bot: Bot,
+    project: Project,
+    asker: Asker,
+    question_service: QuestionService,
+    notifier: Notifier,
+    draft_registry: ActiveDraftRegistry,
 ) -> None:
-    if await views.refuse_password_as_question(message, message.text):
-        return
-    project = await _current_project(message, db_user, project_service)
-    if project is None:
-        return
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    asker = Asker(db_user.telegram_id, message.chat.id, message.message_id)
+    """True event-stream path for real mode; final is sent exactly once."""
     request_id = uuid.uuid4().hex
     try:
         registration = draft_registry.register(
             chat_id=message.chat.id,
             message_thread_id=message.message_thread_id,
-            actor_user_id=db_user.telegram_id,
+            actor_user_id=asker.telegram_id,
         )
     except DraftAlreadyActive:
         await message.answer(texts.ANSWER_IN_PROGRESS)
         return
+
     stop_event = registration.event
     state = AskStreamState()
     delivery = TelegramStreamDelivery(
@@ -185,12 +203,6 @@ async def text_question(
             render_fallback=_stream_fallback,
             stop_event=stop_event,
         )
-    except DomainError as error:
-        await message.answer(views.error_text(error))
-        return
-    except LLMUnavailableError:
-        await message.answer(texts.LLM_UNAVAILABLE)
-        return
     finally:
         draft_registry.unregister(registration)
 
@@ -214,13 +226,61 @@ async def text_question(
     await deliver_outcome(message, project, outcome, question_service, notifier)
 
 
+async def text_question(
+    message: Message,
+    bot: Bot,
+    db_user: User,
+    generation_registry: GenerationRegistry,
+    project_service: ProjectService = Depends(get_obj_project_service),
+    question_service: QuestionService = Depends(get_obj_question_service),
+    notifier: Notifier = Depends(get_obj_notifier),
+    settings: Settings = Depends(get_obj_settings),
+    draft_registry: ActiveDraftRegistry = Depends(get_obj_active_draft_registry),
+) -> None:
+    if await views.refuse_password_as_question(message, message.text):
+        return
+    project = await _current_project(message, db_user, project_service)
+    if project is None:
+        return
+    asker = Asker(db_user.telegram_id, message.chat.id, message.message_id)
+
+    def ask() -> Awaitable[AskOutcome]:
+        return question_service.ask_text(project.id, message.text, asker, RateLimitScope.QUESTION)
+
+    try:
+        if settings.rag_mode == "real" and settings.answer_streaming_enabled:
+            await _ask_private_realtime(
+                message,
+                bot,
+                project,
+                asker,
+                question_service,
+                notifier,
+                draft_registry,
+            )
+            return
+        outcome = await ask_private(message, bot, ask, settings, generation_registry)
+    except DomainError as error:
+        await message.answer(views.error_text(error))
+        return
+    except LLMUnavailableError:
+        await message.answer(texts.LLM_UNAVAILABLE)
+        return
+    if outcome is None:
+        await message.answer(texts.GENERATION_STOPPED)
+        return
+    await deliver_outcome(message, project, outcome, question_service, notifier)
+
+
 async def image_question(
     message: Message,
     bot: Bot,
     db_user: User,
+    generation_registry: GenerationRegistry,
     project_service: ProjectService = Depends(get_obj_project_service),
     question_service: QuestionService = Depends(get_obj_question_service),
     notifier: Notifier = Depends(get_obj_notifier),
+    settings: Settings = Depends(get_obj_settings),
 ) -> None:
     if await views.refuse_password_as_question(message, message.caption):
         return
@@ -246,25 +306,56 @@ async def image_question(
         await message.answer(texts.DOWNLOAD_FAILED)
         return
     asker = Asker(db_user.telegram_id, message.chat.id, message.message_id)
+
+    def ask() -> Awaitable[AskOutcome]:
+        return question_service.ask_image(project.id, image, file_id, message.caption, asker)
+
     try:
-        outcome = await question_service.ask_image(
-            project.id, image, file_id, message.caption, asker
-        )
+        if settings.rag_mode == "real":
+            # Image RAG is not implemented in real mode; do not show a preview.
+            outcome = await ask()
+        else:
+            outcome = await ask_private(message, bot, ask, settings, generation_registry)
     except DomainError as error:
         await message.answer(views.error_text(error))
         return
     except LLMUnavailableError:
         await message.answer(texts.LLM_UNAVAILABLE)
         return
+    if outcome is None:
+        await message.answer(texts.GENERATION_STOPPED)
+        return
     await deliver_outcome(message, project, outcome, question_service, notifier)
+
+
+async def generation_stopped(
+    event: MessageGenerationStopped,
+    generation_registry: GenerationRegistry,
+    draft_registry: ActiveDraftRegistry = Depends(get_obj_active_draft_registry),
+) -> None:
+    """Stop both replay tasks (PR #2) and true-stream drafts (INN-8)."""
+    stopped_task = generation_registry.stop(event.chat.id, event.draft_id)
+    stopped_stream = draft_registry.stop(
+        chat_id=event.chat.id,
+        message_thread_id=event.message_thread_id,
+        draft_id=event.draft_id,
+        actor_user_id=event.chat.id,
+    )
+    if not (stopped_task or stopped_stream):
+        logger.info(
+            "Nothing to stop in chat %s, thread %s, draft %s",
+            event.chat.id,
+            event.message_thread_id,
+            event.draft_id,
+        )
 
 
 def create_router() -> Router:
     router = Router(name="questions")
+    router.stopped_message_generation.register(generation_stopped)
     router.message.filter(F.chat.type == ChatType.PRIVATE, StateFilter(None))
     router.message.register(stop_command, Command("stop"))
     router.message.register(text_question, F.text, ~F.text.startswith("/"))
     router.message.register(image_question, F.photo)
     router.message.register(image_question, F.document.mime_type.startswith("image/"))
-    router.observers["stopped_message_generation"].register(stop_generation)
     return router
