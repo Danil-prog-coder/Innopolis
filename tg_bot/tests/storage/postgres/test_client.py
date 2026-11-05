@@ -6,6 +6,8 @@ from app.storage.postgres.models import (
     DocUpdate,
     GroupChat,
     Invite,
+    KnowledgeGeneration,
+    LlmAttempt,
     Membership,
     Project,
     ProjectBan,
@@ -43,7 +45,18 @@ async def test_big_telegram_ids_fit(pg_client):
 
 
 def test_table_names_come_from_enum():
-    models = (User, Project, Membership, Invite, Question, DocUpdate, GroupChat, ProjectBan)
+    models = (
+        User,
+        Project,
+        Membership,
+        Invite,
+        Question,
+        DocUpdate,
+        GroupChat,
+        ProjectBan,
+        KnowledgeGeneration,
+        LlmAttempt,
+    )
     assert User._meta.db_table == TableName.USERS
     assert {m._meta.db_table for m in models} == set(TableName)
 

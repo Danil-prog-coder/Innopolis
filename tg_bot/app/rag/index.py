@@ -1,10 +1,11 @@
 """Candidate-only ingestion and filtered retrieval.
 
-PERS-43 deliberately does not publish generations: no PostgreSQL CAS, no
-docs_version bump, no DocUpdate/outbox. Candidate points are inert until
-PERS-48 publishes their generation_id. Candidate identity is additionally
-guarded by a manifest point; sequential repeat with changed corpus/config is
-rejected instead of mutating the previous candidate.
+This module never publishes generations: no PostgreSQL pointer, no docs_version
+bump, no DocUpdate. Candidate points are inert until the INN-8 publisher
+(``app.rag.ingestion`` + ``PostgresKnowledgeWork``) verifies the manifest and
+moves the PG active pointer. Candidate identity is additionally guarded by a
+manifest point; sequential repeat with changed corpus/config is rejected instead
+of mutating the previous candidate.
 """
 
 import hashlib
@@ -412,6 +413,14 @@ class RagIndex:
                 raise AppendDocumentChangedError(
                     f"base document changed: {filename or document_id}"
                 )
+
+    def verify_generation(self, snapshot: KnowledgeSnapshot) -> dict[str, object]:
+        """Проверить candidate manifest/points перед PG-публикацией.
+
+        Возвращает проверенный manifest; hash и scope сверяются с snapshot, а не
+        с одним generation_id.
+        """
+        return self._require_manifest(snapshot)
 
     def _require_manifest(self, snapshot: KnowledgeSnapshot) -> dict[str, object]:
         existing = self.store.get_manifest(snapshot)

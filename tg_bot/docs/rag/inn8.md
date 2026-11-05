@@ -1,136 +1,175 @@
-# INN-8: RAG gateway, streaming provider и Telegram draft/final
+# INN-8: публикация snapshot, real gateway и usage ledger
 
-Статус: реализован модульный срез поверх INN-7. В текущий router **не
-подключён**: реальный published snapshot publisher (INN-12) ещё отсутствует.
-Реальные provider/Telegram live-тесты не выполнялись: ключа, endpoint и
-рабочего bot token в этой задаче нет.
+Статус: реализован минимальный безопасный срез publication + real gateway +
+persistent attempt ledger + private-chat streaming draft/final/stop. **INN-8 не
+закрыт**: migration/CAS не проверены на реальном PostgreSQL, live
+provider/Telegram тесты не выполнялись, групповая ACL (INN-10) не реализована —
+real-mode группы fail-closed.
 
-## Граница публикации
+## Публикация snapshot
 
-- `PublishedSnapshotProvider` (`app/llm/published.py`) — read-only контракт:
-  вернуть атомарно опубликованный snapshot проекта или `None`.
-- В production используется `UnavailablePublishedSnapshotProvider`: он всегда
-  падает `PublishedSnapshotUnavailable`, пока INN-12 не реализует PG publisher.
-- PG — единственный authority публикации. Qdrant manifest проверяется
-  `RagIndex` как независимый integrity check, но **не** является вторым
-  publish switch: статус `candidate` в Qdrant не превращается в published.
-- `RagChatGateway` дополнительно отвергает `KnowledgeSnapshot.compat(...)`.
-  Сейчас `QuestionService` ещё строит compat snapshot; это переходное
-  состояние, и gateway намеренно не принимает его за published generation.
-- Fake publisher существует только в тестах. Candidate generation нельзя
-  использовать как published в production.
+PG — единственный authority опубликованной generation.
+
+- `projects.active_generation_id` + `projects.docs_version` задают активную
+  пару generation/version.
+- `knowledge_generations` хранит историю: `generation_id`, `knowledge_version`,
+  `manifest_hash`, mode, base generation, автора и `published_at`.
+- `PostgresKnowledgeWork.publish` в одной транзакции:
+  - блокирует project row (`SELECT FOR UPDATE`);
+  - проверяет `docs_version == expected_version`;
+  - для APPEND проверяет, что base указан и совпадает с текущей active
+    generation внутри той же блокировки;
+  - для REPLACE запрещает base;
+  - вставляет новую generation;
+  - делает version CAS и переключает `active_generation_id`;
+  - создаёт `DocUpdate`;
+  - не удаляет старые generation.
+- Конкурентный publish: один выигрывает CAS, второй получает
+  `KnowledgePublishConflict`. Старая active generation остаётся в истории.
+- `PostgresKnowledgeWork.get` читает PG pointer + matching generation row под
+  одним lock. Несогласованный pointer — `PublishedSnapshotUnavailable`, не
+  `None`.
+- `get_exact` проверяет pinned historical generation. Если публикация случилась
+  между чтением snapshot и gateway, запрос продолжает использовать pinned
+  generation/version; если строка/retention удалена — fail-closed, без
+  смешивания поколений. Qdrant points старых generation не удаляются.
+
+Qdrant manifest остаётся `candidate` и проверяется как integrity check. Он не
+является вторым publish switch: статус в Qdrant не меняется.
+
+## Ингест
+
+`RagIngestionService` — real-mode путь загрузки документов.
+
+- `RagIndex.index_generation` строит candidate и manifest.
+- Перед PG CAS вызывающая сторона проверяет candidate manifest:
+  project, generation, ожидаемую новую version, manifest hash, chunk count,
+  mode и base generation. Одного `generation_id` недостаточно.
+- REPLACE поддержан. **APPEND отклоняется fail-closed**: бот пока не хранит
+  полный предыдущий корпус, поэтому честный merge невозможен.
+- При конфликте публикации candidate остаётся инертным; повтор создаёт новую
+  generation.
+- `DocsService` в real-mode использует publisher и не вызывает
+  `llm.upload_documents`/`bump_docs_version` повторно. Stub/legacy путь явный и
+  не заявляет published generation.
+
+## Snapshot и gateway
+
+- `QuestionService` принимает optional `PublishedSnapshotProvider`. В real-mode
+  provider обязателен; `None`/missing generation — fail-closed, без compat
+  fallback.
+- Stub/test режим по-прежнему использует `KnowledgeSnapshot.compat`.
+- `RagChatGateway` отвергает compat. Для явно переданного snapshot используется
+  `get_exact` (pinned reader), а не повторное чтение latest.
+- Retrieval идёт только по scoped `Source` проверенного snapshot; candidate
+  manifest проверяется `RagIndex`.
+- `RagError` при retrieval превращается в typed `LLMUnavailableError`, не в
+  no-answer.
 
 ## Provider
 
 `app/llm/openai_stream.py` — настраиваемый OpenAI-compatible SSE adapter
 (`/v1/chat/completions`), не заявление о выбранном коммерческом провайдере.
 
-- `stream: true`, истинные `choices[].delta.content`; пробельные delta не
-  выбрасываются.
-- Успех только после `data: [DONE]`. `finish_reason` `length`,
-  `content_filter`, `tool_calls`, `error` считаются незавершённым потоком или
-  ошибкой, а не успешным ответом.
-- `reasoning_content` игнорируется и никогда не отдаётся пользователю.
-- `stream_options.include_usage` — явная capability. Если сервер её не
-  поддерживает, adapter не добавляет опцию; usage не выдумывается.
-- `max_retries != 0` запрещён: ретрай — потенциально платная попытка, а
-  attempt ledger появится в INN-12. Ошибки 429/5xx не повторяются молча.
-- Секреты, тело запроса и ответа не попадают в сообщения ошибок/логи.
+- `base_url`, `model`, `api_key`, `timeout_seconds`, `chat_completions_path`,
+  `include_usage` передаются явно; модель не переписывается.
+- `stream: true`, истинные `choices[].delta.content`; успех только после
+  `[DONE]`. `finish_reason=length/content_filter/tool_calls/error` — не успех.
+- `reasoning_content` игнорируется.
+- `include_usage` — explicit capability; по умолчанию выключена. Пустые
+  `base_url`/`api_key`/`model` и невалидный timeout отклоняются fail-closed.
+- `max_retries != 0` запрещён до explicit attempt ledger/INN-12.
+- Секреты, тело запроса и ответа не логируются.
 
-### Конфигурация
+Целевые модели — DeepSeek-V4.1-Flash-1017 или GLM-5.3-Flash; конкретный
+endpoint ещё не выбран. Реальные capabilities проверяются позже.
 
-`base_url`, `model`, `api_key`, `timeout_seconds`, `chat_completions_path` и
-`include_usage` передаются явно. Нет жёсткой привязки к OpenAI: transport
-использует только OpenAI-compatible JSON/SSE-формат, модель передаётся как
-есть, путь endpoint настраивается. Целевые модели — DeepSeek-V4.1-Flash-1017
-или GLM-5.3-Flash; конкретный недорогой provider ещё не выбран. Реальные
-provider-specific capabilities, включая `stream_options.include_usage`,
-проверяются на выбранном endpoint позже; по умолчанию capability выключена.
-Пустые `base_url`/`api_key`/`model` и невалидный timeout отклоняются
-fail-closed. Ключ не хранится в репозитории и не выводится в лог.
+## Gateway и ledger
 
-```python
-client = OpenAIStreamClient(
-    base_url="https://<endpoint>/v1",
-    api_key="<key>",
-    model="DeepSeek-V4.1-Flash-1017",  # или GLM-5.3-Flash
-    include_usage=False,  # включить после проверки endpoint
-)
-```
-
-## Gateway
-
-`app/llm/rag_gateway.py`: published snapshot → scoped retrieval → provider →
-структурная проверка цитат → terminal event.
-
-- Ответ строится только по `Source` из retrieval в проверенном snapshot.
-- System prompt трактует источники и вопрос как недоверенные данные: встроенные
-  инструкции документов игнорируются, инструменты не вызываются, скрытые
-  рассуждения не показываются.
-- Проверка цитат — **структурная**: метки `[n]` должны ссылаться на источники
-  scoped retrieval. Это не доказательство groundedness; строгая проверка
-  остаётся отдельной задачей.
-- Нет источников → типизированный `found=False`/`NO_EVIDENCE` без вызова
-  модели. Неверная цитата → `contract_violation`, не no-answer.
-- `stop_event` и deadline гоняются с pending `anext`: при остановке/таймауте
-  pending чтение отменяется, upstream закрывается, отдаётся `cancelled` или
-  `unavailable`. Тест использует зависший provider и завершается меньше секунды.
-- Partial текст не кэшируется и не отдаётся как final. Group получает только
-  final.
-- Usage берётся только из фактического usage event provider. Если usage нет,
-  статус `unknown`, counts `None`; ноль не подставляется. Ledger и учёт
-  стоимости — INN-12.
-- `attempt_id` выделяется до первого чтения provider, только после успешного
-  retrieval и проверки stop. `error`/`cancelled`/timeout/contract violation
-  несут `AskEvent.usage` с тем же `request_id`: reported usage, если provider
-  успел его прислать, иначе `unknown` без нулей. `ask()` пробрасывает usage в
-  `LLMUnavailableError`/`LLMCancelledError`. Если provider не вызывался (нет
-  источников или stop до вызова), attempt не создаётся.
+- `stop_event`/deadline гоняются с pending `anext`; при stop/таймауте pending
+  чтение отменяется, upstream закрывается, terminal типизирован.
+- Partial текст не кэшируется и не отдаётся как final.
+- `attempt_id` создаётся до первого чтения provider.
+- `error`/`cancelled`/timeout/contract violation несут `AskEvent.usage` с тем
+  же `request_id`: reported usage, если provider успел его прислать, иначе
+  `unknown` с `None`, не ноль.
+- `llm_attempts` — persistent direct ledger: project, request, attempt,
+  outcome, error code, usage counts/status и cost metadata. Replay с тем же
+  payload идемпотентен; другой project/request/outcome/counts для того же
+  `attempt_id` — `UsageLedgerConflict`.
+- Ledger пишется до final. Если запись не удалась, successful final не
+  выдаётся: gateway отдаёт terminal `unavailable`, чтобы не объявлять учёт
+  успешным. Ошибка/cancel не превращаются в success.
+- При внешней `asyncio.CancelledError` или `aclose()`/`GeneratorExit` после
+  старта provider gateway делает best-effort запись `cancelled` с unknown usage.
+  Точный пробел: если отмена пришлась ровно на незавершённую запись ledger,
+  durable retry/outbox отсутствует — это INN-12. Если provider ещё не
+  вызывался, attempt не создаётся.
+- Это не полный ledger INN-12: нет outbox, reconciliation, агрегации и
+  повторной доставки записей.
 
 ## Telegram
 
-`app/llm/telegram_stream.py` — модуль доставки, пока не подключён к router.
+Private-chat streaming подключён к question router. Group streaming не включён:
+real-mode группы fail-closed до INN-10.
 
-- Private chat: `send_rich_message_draft` со стабильным `draft_id` на request,
-  throttle/coalesce по `DraftPolicy`; draft помечен «⏳ Предварительный ответ»,
-  URLs вырезаны, `skip_entity_detection=True`. Draft — ephemeral preview.
-- Group: drafts отключены, только финальный `send_rich_message`.
-- Terminal state сериализован: stop проверяется после последнего события, перед
-  отправкой и гоняется с самим Telegram-вызовом и retry-задержкой. Если stop
-  победил до доставки, final не отправляется, `terminal=None`,
-  `aborted_by_stop=True`. Уже завершившийся API call не отменяется задним числом.
-- На `cancelled`/`error` финал не отправляется; частичный текст не становится
+- Private chat: stable draft id, throttle/coalesce, preliminary marker, URL
+  defang, `skip_entity_detection`.
+- Final отправляется один раз; no-answer final не отправляется пустым
   сообщением.
-- Retry только `429` (`TelegramRetryAfter`). Timeout/network не повторяется:
-  результат доставки неоднозначен.
-- Plain fallback только для известных форматных `TelegramBadRequest`
-  (parse entities, unclosed/unsupported tag, слишком длинный rich text). Права,
-  чат/thread и прочие 400 пробрасываются, fallback не маскирует их.
-- Draft-ошибки не ломают финал.
+- Stop/final сериализованы; stop побеждает до отправки, retry только 429,
+  plain fallback только для известных форматных BadRequest.
+- Stop приходит и из `stopped_message_generation`, и из `/stop`.
+- `ActiveDraftRegistry` авторизует stop по `chat_id + message_thread_id +
+  actor_user_id + draft_id`, а не по одному 31-bit id.
+- Один активный streaming-запрос на `chat/thread`: второй вопрос отклоняется
+  `ANSWER_IN_PROGRESS` («дождитесь или /stop»), без перезаписи и без утечки
+  первого draft. `/stop` останавливает только текущий chat+thread+actor.
+- Draft ids уникальны среди активных и не переиспользуются сразу; stale stop
+  после unregister — no-op; `unregister` удаляет только свой registration.
+  Регистрация атомарна в event loop. Это process-local: multi-worker требует
+  общего сигнала.
+- Групповой ACL INN-10 не закрыт. Пока в real-mode любые group answers
+  отклоняются `GroupAnswersUnavailable`, включая чужого пользователя/группу.
 
-## Что проверено локально
+## Режимы
 
-Только локальные HTTP SSE и fake Bot API:
+- `RAG_MODE=stub` — explicit dev/test, compat snapshot, без публикации.
+- `RAG_MODE=real` — требует `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` и
+  Qdrant config. При нехватке конфигурации startup падает fail-closed и не
+  подменяется stub. При отсутствии published generation вопрос получает
+  unavailable, не compat-ответ.
+
+## Проверки
+
+Локально без Docker/рабочих БД:
 
 ```bash
-make -C tg_bot test-local ARGS='tests/llm/test_openai_stream_inn8.py tests/llm/test_rag_gateway_inn8.py tests/llm/test_telegram_stream_inn8.py -q'
+make -C tg_bot test-local ARGS='tests/bot tests/services tests/storage tests/llm tests/rag/test_ingestion_publication.py tests/test_dependencies_rag.py -q'
 ```
 
-51 тест проходит: истинные delta/usage capability/`[DONE]`/finish_reason,
-конфигурируемые model/base URL/path, fail-closed конфигурация, отсутствие
-silent retry, отказ compat snapshot, typed `NO_ANSWER`, stop/deadline с
-зависшим provider, retained usage на error/cancel/contract violation,
-attempt только при вызове provider, unknown usage без нулей, draft/final,
-group-only-final, preliminary/URL-safe draft, stop vs final (после события,
-во время retry-задержки и in-flight send), отмена, 429-only retry и узкий
-plain fallback.
+Покрыто: PG pointer/CAS/retention на SQLite, pinned historical snapshot,
+stale conflict, APPEND/REPLACE policy, manifest scope/hash mismatch до CAS,
+ledger idempotency/conflict, unknown cancel, ledger failure не даёт success,
+external cancellation, fail-closed DI, no-answer без пустого Telegram final,
+private streaming stop через update/`/stop`, stop из чужого chat/actor,
+независимые thread, отказ второго запроса в том же thread, уникальные draft
+ids, stale/unregister, real-mode group ACL fail-closed.
 
-## Блокеры до реального включения
+Postgres-only concurrent publish test помечен skip без `TEST_POSTGRES_URL`.
+Реальный Postgres/Redis и live provider **не проверены**: Docker не отвечает,
+рабочие БД и Redis DB0 не используются.
 
-1. INN-12: PG publisher, атомарная публикация generation/version, attempt
-   ledger, отказ от candidate/compat в production.
-2. Конфигурация provider (base URL, model, secret, timeout, usage capability) и
-   отдельный real integration test.
-3. Реальный Telegram bot token для live draft/final проверки; сейчас только
-   fake Bot API.
-4. Строгая groundedness-проверка цитат (структурная проверка уже есть).
+## Остаётся
+
+1. Проверить migration и CAS на выделенной одноразовой Postgres БД; Docker
+   сейчас не отвечает, поэтому эта часть **не закрыта**.
+2. Выбрать endpoint/ключ, проверить `include_usage` и выполнить real provider
+   test; live Telegram streaming/stop test с отдельным token.
+3. INN-10: авторизация/аудитория group answers. До неё real-mode группы
+   fail-closed.
+4. Полный INN-12: outbox/reconciliation ledger, corpus storage для честного
+   APPEND, retention/агрегация. Повторная загрузка после неоднозначного
+   ответа не идемпотентна и может опубликовать следующую version.
+5. Process-local stop registry: для multi-worker нужен общий сигнал.
+6. Строгая groundedness-проверка цитат.

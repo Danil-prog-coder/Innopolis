@@ -10,6 +10,8 @@ class TableName(StrEnum):
     DOC_UPDATES = "doc_updates"
     GROUP_CHATS = "group_chats"
     PROJECT_BANS = "project_bans"
+    KNOWLEDGE_GENERATIONS = "knowledge_generations"
+    LLM_ATTEMPTS = "llm_attempts"
 
 
 class RedisKey(StrEnum):

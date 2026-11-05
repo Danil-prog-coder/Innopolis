@@ -92,3 +92,7 @@ class FileTooLarge(DomainError):
 
 class NoFilesToUpload(DomainError):
     pass
+
+
+class GroupAnswersUnavailable(DomainError):
+    """Real-mode group answers need an explicit audience/ACL decision (INN-10)."""

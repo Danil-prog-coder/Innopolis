@@ -11,10 +11,18 @@ from tests.bot.conftest import ADMIN_TG, FRESH_TG, OUTSIDER_TG
 async def test_all_factories_resolve(resolver):
     names = [n for n in dir(dependencies) if n.startswith("get_obj_")]
     assert len(names) >= 27
+    # Heavy real-only factories are built lazily in real mode.
+    skip = {"get_obj_fsm_storage", "get_obj_rag_index"}
+    # Optional in stub mode: real mode injects them from PG.
+    optional = {"get_obj_published_snapshots", "get_obj_knowledge_publisher"}
     for name in names:
-        if name == "get_obj_fsm_storage":
-            continue  # требует реального RedisClient; собирается в __main__
-        assert await resolver.resolve(getattr(dependencies, name)) is not None, name
+        if name in skip:
+            continue
+        resolved = await resolver.resolve(getattr(dependencies, name))
+        if name in optional:
+            assert resolved is None, name
+        else:
+            assert resolved is not None, name
 
 
 async def test_start_shows_roles(feed, session):

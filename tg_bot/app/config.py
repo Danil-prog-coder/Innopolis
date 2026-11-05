@@ -1,3 +1,4 @@
+from typing import Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -28,6 +29,19 @@ class Settings(BaseSettings):
     password_attempts_window_seconds: int = 900
     password_reveal_ttl_seconds: int = 600
     docs_max_files: int = 10
+
+    # stub — явный dev/test режим без публикации. real требует полный provider
+    # config и published generation; при нехватке конфигурации startup fail-closed.
+    rag_mode: Literal["stub", "real"] = "stub"
+    rag_qdrant_path: str = "data/qdrant"
+    rag_qdrant_url: str = ""
+    rag_qdrant_api_key: SecretStr = SecretStr("")
+    llm_base_url: str = ""
+    llm_model: str = ""
+    llm_api_key: SecretStr = SecretStr("")
+    llm_timeout_seconds: float = 60.0
+    llm_include_usage: bool = False
+    llm_chat_completions_path: str = "/chat/completions"
 
     # Часовой пояс расписания заданий (IANA, например Europe/Moscow)
     scheduler_timezone: str = "Europe/Moscow"

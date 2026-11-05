@@ -1,13 +1,18 @@
+import asyncio
+
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import (
     AnswerCallbackQuery,
     DeleteMessage,
     SendMessage,
     SendPhoto,
     SendRichMessage,
+    SendRichMessageDraft,
 )
-from aiogram.types import ReplyKeyboardMarkup
+from aiogram.types import Chat, MessageGenerationStopped, ReplyKeyboardMarkup, Update
 
+from app import dependencies
 from app.bot import texts
 from app.bot.callbacks import (
     AnswerQuestionCb,
@@ -20,11 +25,52 @@ from app.bot.callbacks import (
     SwitchProjectCb,
 )
 from app.core.enums import DocsMode, MemberRole, QuestionStatus
-from app.llm.gateway import AskResult, DocFile
+from app.dependencies import get_obj_active_draft_registry
+from app.llm.gateway import (
+    AskError,
+    AskErrorCode,
+    AskEvent,
+    AskEventType,
+    AskResult,
+    DocFile,
+)
 from app.storage.postgres.models import GroupChat, Question
 from tests.bot.conftest import ADMIN_TG, FRESH_TG, OUTSIDER_TG, SECOND_ADMIN_TG, USER_TG
 
 FOUND = AskResult(found=True, answer="ответ", legacy_no_sources=True)
+
+
+class WaitingStreamingLLM:
+    async def ask_stream(
+        self,
+        project_id,
+        question,
+        request_id,
+        *,
+        snapshot=None,
+        stop_event=None,
+    ):
+        yield AskEvent(type=AskEventType.STATUS, request_id=request_id, seq=1)
+        yield AskEvent(
+            type=AskEventType.DELTA,
+            request_id=request_id,
+            seq=2,
+            text="A [1]",
+        )
+        if stop_event is not None:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2)
+            except TimeoutError:
+                pass
+        yield AskEvent(
+            type=AskEventType.CANCELLED,
+            request_id=request_id,
+            seq=3,
+            error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
+        )
+
+    async def close(self):
+        return None
 
 
 @pytest.fixture
@@ -119,6 +165,7 @@ async def test_rejected_rich_answer_falls_back_to_plain_text(
     feed, session, fake_llm, user_in_project
 ):
     session.failing_methods.add("SendRichMessage")
+    session.failing_message = "can't parse entities: unexpected end of tag"
     fake_llm.answer = AskResult(
         found=True, answer="Нажмите <Сохранить> & готово", legacy_no_sources=True
     )
@@ -127,6 +174,179 @@ async def test_rejected_rich_answer_falls_back_to_plain_text(
     assert sent.text.startswith("Нажмите <Сохранить> & готово")
     assert sent.parse_mode is None
     assert sent.reply_parameters.message_id == message.message_id
+
+
+async def test_stopped_generation_update_sets_active_draft(dp, bot):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=None,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await dp.feed_update(
+            bot,
+            Update(
+                update_id=999,
+                stopped_message_generation=MessageGenerationStopped(
+                    chat=Chat(id=USER_TG.id, type="private"),
+                    draft_id=registration.draft_id,
+                ),
+            ),
+        )
+        assert registration.event.is_set()
+    finally:
+        registry.unregister(registration)
+
+
+async def test_stop_command_stops_own_active_draft(feed, session):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=None,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await feed.message("/stop", from_user=USER_TG)
+        assert registration.event.is_set()
+        assert session.last(SendMessage).text == texts.ANSWER_STOPPED
+    finally:
+        registry.unregister(registration)
+
+
+async def test_stop_command_from_foreign_user_is_noop(feed, session):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=None,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await feed.message("/stop", from_user=OUTSIDER_TG)
+        assert not registration.event.is_set()
+        assert session.last(SendMessage).text == texts.NOTHING_TO_STOP
+    finally:
+        registry.unregister(registration)
+
+
+async def test_second_question_in_same_thread_is_rejected(feed, session, fake_llm, user_in_project):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=None,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await feed.message("второй вопрос", from_user=USER_TG)
+        assert session.last(SendMessage).text == texts.ANSWER_IN_PROGRESS
+        assert fake_llm.ask_calls == 0
+    finally:
+        registry.unregister(registration)
+
+
+async def test_question_in_independent_thread_is_allowed(feed, session, fake_llm, user_in_project):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=10,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await feed.message("вопрос", from_user=USER_TG, message_thread_id=11)
+        assert fake_llm.ask_calls == 1
+        assert session.last(SendMessage).text != texts.ANSWER_IN_PROGRESS
+    finally:
+        registry.unregister(registration)
+
+
+async def test_stop_command_is_scoped_to_current_thread(feed, session):
+    registry = get_obj_active_draft_registry()
+    first = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=10,
+        actor_user_id=USER_TG.id,
+    )
+    second = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=11,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await feed.message("/stop", from_user=USER_TG, message_thread_id=10)
+        assert first.event.is_set()
+        assert not second.event.is_set()
+        assert session.last(SendMessage).text == texts.ANSWER_STOPPED
+    finally:
+        registry.unregister(first)
+        registry.unregister(second)
+
+
+async def test_stopped_generation_from_foreign_chat_cannot_stop(dp, bot):
+    registry = get_obj_active_draft_registry()
+    registration = registry.register(
+        chat_id=USER_TG.id,
+        message_thread_id=None,
+        actor_user_id=USER_TG.id,
+    )
+    try:
+        await dp.feed_update(
+            bot,
+            Update(
+                update_id=1000,
+                stopped_message_generation=MessageGenerationStopped(
+                    chat=Chat(id=OUTSIDER_TG.id, type="private"),
+                    draft_id=registration.draft_id,
+                ),
+            ),
+        )
+        assert not registration.event.is_set()
+    finally:
+        registry.unregister(registration)
+
+
+async def test_stop_update_aborts_streaming_final(
+    feed, session, dp, bot, resolver, user_in_project
+):
+    resolver.overrides[dependencies.get_obj_llm_gateway] = lambda: WaitingStreamingLLM()
+    task = asyncio.create_task(feed.message("q", from_user=USER_TG))
+    try:
+        for _ in range(100):
+            if session.all(SendRichMessageDraft):
+                break
+            await asyncio.sleep(0.01)
+        draft = session.last(SendRichMessageDraft)
+        await dp.feed_update(
+            bot,
+            Update(
+                update_id=1001,
+                stopped_message_generation=MessageGenerationStopped(
+                    chat=Chat(id=USER_TG.id, type="private"),
+                    draft_id=draft.draft_id,
+                ),
+            ),
+        )
+        await asyncio.wait_for(task, timeout=2)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert session.last(SendMessage).text == texts.ANSWER_STOPPED
+    assert session.all(SendRichMessage) == []
+
+
+async def test_permission_rich_error_does_not_fall_back(feed, session, fake_llm, user_in_project):
+    session.failing_methods.add("SendRichMessage")
+    session.failing_message = "not enough rights to send messages"
+    fake_llm.answer = AskResult(found=True, answer="ответ", legacy_no_sources=True)
+
+    with pytest.raises(TelegramBadRequest):
+        await feed.message("q", from_user=USER_TG)
+
+    assert not any(
+        isinstance(request, SendMessage) and request.chat_id == USER_TG.id
+        for request in session.requests
+    )
 
 
 async def test_not_found_goes_to_admins(feed, session, user_in_project, admin, second_admin):
@@ -343,6 +563,31 @@ async def test_mention_question_answered_in_group(
     assert fake_llm.last_question == "что такое X?"
     assert fake_llm.last_project_id == project.id
     assert session.last(SendMessage).chat_id == GROUP
+
+
+async def test_real_mode_group_answer_fails_closed_for_foreign_user(
+    feed, session, fake_llm, project_password, resolver, settings
+):
+    resolver.overrides[dependencies.get_obj_settings] = lambda: settings.model_copy(
+        update={"rag_mode": "real"}
+    )
+    await feed.message(
+        f"/join@test_bot {project_password}",
+        chat_type="supergroup",
+        chat_id=GROUP,
+        from_user=OUTSIDER_TG,
+    )
+    await feed.message(
+        "@test_bot закрытый вопрос",
+        entities=[{"type": "mention", "offset": 0, "length": 9}],
+        chat_type="supergroup",
+        chat_id=GROUP,
+        from_user=USER_TG,
+    )
+
+    assert session.last(SendMessage).text == texts.GROUP_ANSWERS_UNAVAILABLE
+    assert session.all(SendRichMessage) == []
+    assert fake_llm.ask_calls == 0
 
 
 async def test_group_ignores_plain_messages(feed, fake_llm, project_password):

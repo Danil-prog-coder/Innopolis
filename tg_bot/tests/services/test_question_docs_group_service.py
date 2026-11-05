@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -7,6 +8,7 @@ from app.core.errors import (
     DocUpdateNotFound,
     EmptyQuestion,
     FileTooLarge,
+    GroupAnswersUnavailable,
     InvalidPassword,
     NoFilesToUpload,
     NotProjectAdmin,
@@ -18,9 +20,16 @@ from app.core.errors import (
     RemovedFromProject,
     TooManyAttempts,
 )
-from app.llm.gateway import AskResult, DocFile, LLMUnavailableError
+from app.llm.gateway import (
+    AskEventType,
+    AskResult,
+    DocFile,
+    KnowledgeSnapshot,
+    LLMUnavailableError,
+)
+from app.llm.published import PublishedSnapshotUnavailable
 from app.services.docs_service import DocsService
-from app.services.question_service import Asker
+from app.services.question_service import Asker, AskStreamState, QuestionService
 from app.storage.postgres.models import Project
 
 ASKER = Asker(telegram_id=1002, chat_id=1002, message_id=10)
@@ -40,6 +49,177 @@ async def test_ask_uses_cache_second_time(question_service, fake_llm, project):
         assert outcome.answer == "A" and outcome.question is None
     assert fake_llm.ask_calls == 1
     assert fake_llm.last_project_id == project.id
+
+
+class NoPublishedSnapshot:
+    async def get(self, project_id):
+        return None
+
+
+class FixedPublishedSnapshot:
+    def __init__(self, snapshot: KnowledgeSnapshot) -> None:
+        self.snapshot = snapshot
+
+    async def get(self, project_id):
+        assert project_id == self.snapshot.project_id
+        return self.snapshot
+
+
+def published_service(
+    fake_llm,
+    answer_cache_work,
+    rate_limit_work,
+    question_work,
+    project_work,
+    membership_work,
+    access_guard,
+    settings,
+    snapshots,
+) -> QuestionService:
+    return QuestionService(
+        fake_llm,
+        answer_cache_work,
+        rate_limit_work,
+        question_work,
+        project_work,
+        membership_work,
+        access_guard,
+        settings,
+        snapshots=snapshots,
+    )
+
+
+async def test_real_mode_without_published_snapshot_fails_closed(
+    fake_llm,
+    answer_cache_work,
+    rate_limit_work,
+    question_work,
+    project_work,
+    membership_work,
+    access_guard,
+    settings,
+    project,
+):
+    service = published_service(
+        fake_llm,
+        answer_cache_work,
+        rate_limit_work,
+        question_work,
+        project_work,
+        membership_work,
+        access_guard,
+        settings,
+        NoPublishedSnapshot(),
+    )
+
+    with pytest.raises(PublishedSnapshotUnavailable):
+        await service.ask_text(project.id, "Q", ASKER, RateLimitScope.QUESTION)
+
+    assert fake_llm.ask_calls == 0
+
+
+async def test_real_mode_passes_published_snapshot_to_gateway(
+    fake_llm,
+    answer_cache_work,
+    rate_limit_work,
+    question_work,
+    project_work,
+    membership_work,
+    access_guard,
+    settings,
+    project,
+):
+    snapshot = KnowledgeSnapshot(project.id, "gen-published", 1)
+    service = published_service(
+        fake_llm,
+        answer_cache_work,
+        rate_limit_work,
+        question_work,
+        project_work,
+        membership_work,
+        access_guard,
+        settings,
+        FixedPublishedSnapshot(snapshot),
+    )
+    fake_llm.answer = FOUND
+
+    outcome = await service.ask_text(project.id, "Q", ASKER, RateLimitScope.QUESTION)
+
+    assert outcome.answer == "A"
+    assert outcome.snapshot == snapshot
+    assert fake_llm.last_snapshot == snapshot
+
+
+async def test_real_mode_group_answer_fails_closed_for_foreign_group(
+    fake_llm,
+    answer_cache_work,
+    rate_limit_work,
+    question_work,
+    project_work,
+    membership_work,
+    access_guard,
+    settings,
+    project,
+):
+    real_settings = settings.model_copy(update={"rag_mode": "real"})
+    service = QuestionService(
+        fake_llm,
+        answer_cache_work,
+        rate_limit_work,
+        question_work,
+        project_work,
+        membership_work,
+        access_guard,
+        real_settings,
+        snapshots=NoPublishedSnapshot(),
+    )
+    foreign_group_asker = Asker(telegram_id=9999, chat_id=-1009999, message_id=1)
+
+    with pytest.raises(GroupAnswersUnavailable):
+        await service.ask_text(
+            project.id,
+            "закрытый вопрос",
+            foreign_group_asker,
+            RateLimitScope.GROUP_QUESTION,
+        )
+
+    assert fake_llm.ask_calls == 0
+
+
+async def test_stream_answer_and_cache_hit(question_service, fake_llm, project):
+    fake_llm.answer = FOUND
+    first_state = AskStreamState()
+    first_events = [
+        event
+        async for event in question_service.ask_text_stream(
+            project.id,
+            "Q",
+            ASKER,
+            RateLimitScope.QUESTION,
+            request_id="req-1",
+            state=first_state,
+        )
+    ]
+    assert first_events[-1].type is AskEventType.FINAL
+    assert first_state.outcome is not None
+    assert first_state.outcome.answer == "A"
+
+    second_state = AskStreamState()
+    second_events = [
+        event
+        async for event in question_service.ask_text_stream(
+            project.id,
+            "Q",
+            ASKER,
+            RateLimitScope.QUESTION,
+            request_id="req-2",
+            state=second_state,
+        )
+    ]
+    assert second_events[-1].type is AskEventType.FINAL
+    assert second_state.outcome is not None
+    assert second_state.outcome.answer == "A"
+    assert fake_llm.ask_calls == 1
 
 
 async def test_not_found_creates_question(question_service, fake_llm, project):
@@ -162,6 +342,48 @@ async def test_apply_update_bumps_version_and_stores_summary(
     assert update.summary == "Добавлен раздел" and update.mode == DocsMode.REPLACE
     assert (await Project.get(id=project.id)).docs_version == 1
     assert fake_llm.uploads == [(project.id, DocsMode.REPLACE, ["a.md"])]
+
+
+async def test_real_docs_path_uses_publisher_not_upload_documents(
+    fake_llm,
+    project_work,
+    doc_update_work,
+    membership_work,
+    access_guard,
+    project,
+    admin,
+):
+    update = await doc_update_work.create(
+        project.id, admin.id, DocsMode.REPLACE, "Опубликована версия 1"
+    )
+
+    class FakePublisher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def ingest_and_publish(self, project_id, mode, files, *, created_by_id):
+            self.calls.append((project_id, mode, [file.filename for file in files], created_by_id))
+            return SimpleNamespace(doc_update=update)
+
+    publisher = FakePublisher()
+    service = DocsService(
+        fake_llm,
+        project_work,
+        doc_update_work,
+        membership_work,
+        access_guard,
+        publisher,
+    )
+
+    result = await service.apply_update(
+        admin, project.id, DocsMode.REPLACE, [DocFile("a.md", b"x")]
+    )
+
+    assert result is update
+    assert fake_llm.uploads == []
+    assert publisher.calls == [(project.id, DocsMode.REPLACE, ["a.md"], admin.id)]
+    # The publisher owns version bump; DocsService must not bump a second time.
+    assert (await Project.get(id=project.id)).docs_version == 0
 
 
 async def test_llm_failure_keeps_docs_version(docs_service, fake_llm, project, admin):

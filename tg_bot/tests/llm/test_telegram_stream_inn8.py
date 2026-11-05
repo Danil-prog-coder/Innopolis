@@ -55,6 +55,18 @@ FINAL = AskEvent(
     seq=4,
     result=RESULT,
 )
+NO_ANSWER_RESULT = AskResult(
+    found=False,
+    answer=None,
+    snapshot=SNAPSHOT,
+    request_id="req-1",
+)
+NO_ANSWER_FINAL = AskEvent(
+    type=AskEventType.FINAL,
+    request_id="req-1",
+    seq=4,
+    result=NO_ANSWER_RESULT,
+)
 
 
 def delta(text: str, seq: int) -> AskEvent:
@@ -88,7 +100,9 @@ class FakeBot:
         self.draft_skip_detection.append(rich_message.skip_entity_detection)
         return True
 
-    async def send_rich_message(self, chat_id, rich_message, *, message_thread_id=None):
+    async def send_rich_message(
+        self, chat_id, rich_message, *, message_thread_id=None, reply_parameters=None
+    ):
         self.final_calls += 1
         self.first_final_attempt.set()
         if self.bad_rich_message is not None:
@@ -110,7 +124,9 @@ class FakeBot:
             text=text,
         )
 
-    async def send_message(self, chat_id, text, *, parse_mode=None, message_thread_id=None):
+    async def send_message(
+        self, chat_id, text, *, parse_mode=None, message_thread_id=None, reply_parameters=None
+    ):
         self.messages.append(text)
         return Message(
             message_id=2,
@@ -168,6 +184,20 @@ async def test_zero_interval_sends_each_delta_as_same_draft():
     assert [draft[2][len(DRAFT_PREFIX) :] for draft in bot.drafts] == ["A", "AB [1]"]
 
 
+async def test_explicit_registry_draft_id_is_used():
+    bot = FakeBot()
+    delivery = TelegramStreamDelivery(
+        bot,
+        100,
+        draft_id=777,
+        policy=DraftPolicy(min_interval_seconds=0),
+    )
+
+    await delivery.deliver(stream(status(), delta("A [1]", 2), FINAL), "req-1", render_final=render)
+
+    assert bot.drafts[0][1] == 777
+
+
 async def test_group_receives_only_final():
     bot = FakeBot()
     delivery = TelegramStreamDelivery(bot, -100, policy=DraftPolicy(min_interval_seconds=0))
@@ -179,6 +209,18 @@ async def test_group_receives_only_final():
     assert outcome.drafts_sent == 0
     assert bot.drafts == []
     assert bot.finals == ["Ответ [1]"]
+
+
+async def test_no_answer_final_is_not_sent_as_empty_message():
+    bot = FakeBot()
+    delivery = TelegramStreamDelivery(bot, 100)
+
+    outcome = await delivery.deliver(stream(NO_ANSWER_FINAL), "req-1", render_final=render)
+
+    assert outcome.final_sent is False
+    assert outcome.terminal is NO_ANSWER_FINAL
+    assert bot.final_calls == 0
+    assert bot.finals == []
 
 
 async def test_cancelled_never_sends_partial_as_final():

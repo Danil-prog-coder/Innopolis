@@ -1,13 +1,14 @@
 """RAG gateway: published snapshot -> scoped retrieval -> real SSE provider.
 
-The published snapshot comes only from ``PublishedSnapshotProvider`` (PG
-authority, INN-12). Candidate manifests are never used as a publication switch.
-The Qdrant manifest is still verified by ``RagIndex`` as an index-integrity
-check. INN-8 wiring is modular; real mode stays unavailable until the publisher
-and provider configuration exist.
+The published snapshot comes only from ``PublishedSnapshotProvider`` backed by
+the PG project pointer. Candidate manifests are never used as a publication
+switch; the Qdrant manifest is still verified by ``RagIndex`` as an integrity
+check. Terminal attempts are written to the persistent usage ledger when it is
+configured. Telegram draft/stop wiring remains a separate INN-8 step.
 """
 
 import asyncio
+import logging
 import math
 import re
 import uuid
@@ -36,8 +37,22 @@ from app.llm.gateway import (
 )
 from app.llm.openai_stream import CompletionChunk
 from app.llm.published import PublishedSnapshotProvider, PublishedSnapshotUnavailable
+from app.rag.chunking import RagError
+
+logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+
+
+class UsageLedger(Protocol):
+    async def record(
+        self,
+        project_id: int,
+        attempt: AttemptUsage,
+        *,
+        outcome: str,
+        error_code: str | None = None,
+    ) -> object: ...
 
 
 class RetrievalIndex(Protocol):
@@ -82,15 +97,42 @@ class RagChatGateway(LLMGateway):
         provider: StreamingProvider,
         snapshots: PublishedSnapshotProvider,
         config: RagGatewayConfig | None = None,
+        usage_ledger: UsageLedger | None = None,
     ) -> None:
         self._index = index
         self._provider = provider
         self._snapshots = snapshots
         self._config = config or RagGatewayConfig()
+        self._usage_ledger = usage_ledger
 
     async def _resolve_snapshot(
         self, project_id: int, snapshot: KnowledgeSnapshot | None
     ) -> KnowledgeSnapshot:
+        if snapshot is not None:
+            if snapshot.is_compat:
+                raise PublishedSnapshotUnavailable("compat snapshot is not published")
+            exact = getattr(self._snapshots, "get_exact", None)
+            if exact is not None:
+                # Pinned reader: a publication between QuestionService's read and
+                # this call must not switch generations mid-request. The exact
+                # historical row is verified; if retention removed it, fail
+                # closed instead of mixing generations.
+                pinned = await exact(project_id, snapshot)
+                if pinned != snapshot:
+                    raise LLMContractError("pinned snapshot verification changed it")
+                return pinned
+
+            published = await self._snapshots.get(project_id)
+            if published is None:
+                raise PublishedSnapshotUnavailable("no published snapshot")
+            if published.project_id != project_id:
+                raise LLMContractError("published snapshot project mismatch")
+            if published != snapshot:
+                raise LLMContractError(
+                    "published snapshot changed and pinned verification is unavailable"
+                )
+            return snapshot
+
         published = await self._snapshots.get(project_id)
         if published is None:
             raise PublishedSnapshotUnavailable("no published snapshot")
@@ -101,18 +143,48 @@ class RagChatGateway(LLMGateway):
             raise PublishedSnapshotUnavailable("compat snapshot is not published")
         if published.project_id != project_id:
             raise LLMContractError("published snapshot project mismatch")
-        if snapshot is not None and snapshot != published:
-            raise LLMContractError("explicit snapshot is not the published snapshot")
         return published
 
     async def _retrieve(self, snapshot: KnowledgeSnapshot, question: str) -> list[Source]:
-        return await asyncio.to_thread(
-            self._index.search,
-            snapshot,
-            question,
-            candidate_k=self._config.candidate_k,
-            context_top_k=self._config.context_top_k,
-        )
+        try:
+            return await asyncio.to_thread(
+                self._index.search,
+                snapshot,
+                question,
+                candidate_k=self._config.candidate_k,
+                context_top_k=self._config.context_top_k,
+            )
+        except RagError as error:
+            # Missing/corrupt manifest, scope mismatch or partial candidate:
+            # fail closed as a service error, never as no-answer.
+            raise LLMUnavailableError("retrieval failed") from error
+        except Exception as error:
+            logger.exception("RAG retrieval failed for project %s", snapshot.project_id)
+            raise LLMUnavailableError("retrieval failed") from error
+
+    async def _record_usage(
+        self,
+        project_id: int,
+        attempt: AttemptUsage,
+        *,
+        outcome: str,
+        error_code: str | None = None,
+    ) -> bool:
+        if self._usage_ledger is None:
+            return True
+        try:
+            await self._usage_ledger.record(
+                project_id,
+                attempt,
+                outcome=outcome,
+                error_code=error_code,
+            )
+        except Exception:
+            # A paid call happened. Never report accounting as successful when
+            # the ledger write failed; callers turn this into a terminal error.
+            logger.exception("Failed to persist LLM attempt %s", attempt.attempt_id)
+            return False
+        return True
 
     @staticmethod
     def _messages(question: str, sources: list[Source]) -> list[dict[str, str]]:
@@ -275,6 +347,7 @@ class RagChatGateway(LLMGateway):
         attempt_id = uuid.uuid4().hex
         parts: list[str] = []
         usage: TokenUsage | None = None
+        usage_recorded = False
 
         def attempt_usage() -> AttemptUsage:
             return AttemptUsage(
@@ -298,23 +371,34 @@ class RagChatGateway(LLMGateway):
                 )
                 outcome, chunk, error = await self._next_racing(iterator, stop_event, remaining)
                 if outcome == "cancelled":
+                    attempt = attempt_usage()
+                    usage_recorded = await self._record_usage(
+                        project_id, attempt, outcome="cancelled"
+                    )
                     seq += 1
                     yield AskEvent(
                         type=AskEventType.CANCELLED,
                         request_id=request_id,
                         seq=seq,
                         error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
-                        usage=attempt_usage(),
+                        usage=attempt,
                     )
                     return
                 if outcome == "timeout":
+                    attempt = attempt_usage()
+                    usage_recorded = await self._record_usage(
+                        project_id,
+                        attempt,
+                        outcome="error",
+                        error_code=AskErrorCode.UNAVAILABLE.value,
+                    )
                     seq += 1
                     yield AskEvent(
                         type=AskEventType.ERROR,
                         request_id=request_id,
                         seq=seq,
                         error=AskError(code=AskErrorCode.UNAVAILABLE, retryable=True),
-                        usage=attempt_usage(),
+                        usage=attempt,
                     )
                     return
                 if outcome == "done":
@@ -325,6 +409,13 @@ class RagChatGateway(LLMGateway):
                         if isinstance(error, LLMContractError)
                         else AskErrorCode.UNAVAILABLE
                     )
+                    attempt = attempt_usage()
+                    usage_recorded = await self._record_usage(
+                        project_id,
+                        attempt,
+                        outcome="error",
+                        error_code=code.value,
+                    )
                     seq += 1
                     yield AskEvent(
                         type=AskEventType.ERROR,
@@ -334,7 +425,7 @@ class RagChatGateway(LLMGateway):
                             code=code,
                             retryable=code is AskErrorCode.UNAVAILABLE,
                         ),
-                        usage=attempt_usage(),
+                        usage=attempt,
                     )
                     return
                 if chunk.usage is not None:
@@ -348,6 +439,25 @@ class RagChatGateway(LLMGateway):
                         seq=seq,
                         text=chunk.text,
                     )
+        except asyncio.CancelledError:
+            # The consumer can cancel the generator before a terminal event.
+            # The provider call may already be paid, so record it here.
+            if not usage_recorded:
+                await self._record_usage(
+                    project_id,
+                    attempt_usage(),
+                    outcome="cancelled",
+                )
+            raise
+        except GeneratorExit:
+            # aclose() before a terminal event is the same paid-attempt case.
+            if not usage_recorded:
+                await self._record_usage(
+                    project_id,
+                    attempt_usage(),
+                    outcome="cancelled",
+                )
+            raise
         finally:
             close = getattr(iterator, "aclose", None)
             if close is not None:
@@ -355,16 +465,35 @@ class RagChatGateway(LLMGateway):
 
         answer = "".join(parts).strip()
         if not answer:
+            attempt = attempt_usage()
+            usage_recorded = await self._record_usage(
+                project_id,
+                attempt,
+                outcome="error",
+                error_code=AskErrorCode.UNAVAILABLE.value,
+            )
             seq += 1
             yield AskEvent(
                 type=AskEventType.ERROR,
                 request_id=request_id,
                 seq=seq,
                 error=AskError(code=AskErrorCode.UNAVAILABLE, retryable=True),
-                usage=attempt_usage(),
+                usage=attempt,
             )
             return
         if answer.casefold() == "no_answer":
+            attempt = attempt_usage()
+            usage_recorded = await self._record_usage(project_id, attempt, outcome="no_answer")
+            if not usage_recorded:
+                seq += 1
+                yield AskEvent(
+                    type=AskEventType.ERROR,
+                    request_id=request_id,
+                    seq=seq,
+                    error=AskError(code=AskErrorCode.UNAVAILABLE, retryable=True),
+                    usage=attempt,
+                )
+                return
             seq += 1
             yield AskEvent(
                 type=AskEventType.FINAL,
@@ -376,23 +505,42 @@ class RagChatGateway(LLMGateway):
                     snapshot=resolved,
                     request_id=request_id,
                     no_answer_reason=NoAnswerReason.NOT_ANSWERABLE,
-                    usage=attempt_usage(),
+                    usage=attempt,
                 ),
             )
             return
         try:
             self._citations(answer, sources)
         except LLMContractError:
+            attempt = attempt_usage()
+            usage_recorded = await self._record_usage(
+                project_id,
+                attempt,
+                outcome="error",
+                error_code=AskErrorCode.CONTRACT_VIOLATION.value,
+            )
             seq += 1
             yield AskEvent(
                 type=AskEventType.ERROR,
                 request_id=request_id,
                 seq=seq,
                 error=AskError(code=AskErrorCode.CONTRACT_VIOLATION, retryable=False),
-                usage=attempt_usage(),
+                usage=attempt,
             )
             return
 
+        attempt = attempt_usage()
+        usage_recorded = await self._record_usage(project_id, attempt, outcome="success")
+        if not usage_recorded:
+            seq += 1
+            yield AskEvent(
+                type=AskEventType.ERROR,
+                request_id=request_id,
+                seq=seq,
+                error=AskError(code=AskErrorCode.UNAVAILABLE, retryable=True),
+                usage=attempt,
+            )
+            return
         seq += 1
         yield AskEvent(
             type=AskEventType.FINAL,
@@ -404,7 +552,7 @@ class RagChatGateway(LLMGateway):
                 sources=tuple(sources),
                 snapshot=resolved,
                 request_id=request_id,
-                usage=attempt_usage(),
+                usage=attempt,
             ),
         )
 
@@ -426,3 +574,6 @@ class RagChatGateway(LLMGateway):
 
     async def close(self) -> None:
         await self._provider.close()
+        close = getattr(self._index, "close", None)
+        if close is not None:
+            close()

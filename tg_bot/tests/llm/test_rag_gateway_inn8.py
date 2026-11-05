@@ -40,6 +40,21 @@ def source(label: str = "[1]") -> Source:
     )
 
 
+def source_for(snapshot: KnowledgeSnapshot, label: str = "[1]") -> Source:
+    return Source(
+        project_id=snapshot.project_id,
+        generation_id=snapshot.generation_id,
+        knowledge_version=snapshot.knowledge_version,
+        document_id="doc-1",
+        document_version="v1",
+        chunk_id=f"chunk-{label}",
+        title="Настройка доступа",
+        excerpt="Код доступа: ALPHA-42",
+        citation_label=label,
+        section_path="Профиль → Доступ",
+    )
+
+
 class FakeIndex:
     def __init__(self, sources: list[Source]) -> None:
         self.sources = sources
@@ -58,6 +73,34 @@ class FakeSnapshots:
     async def get(self, project_id: int):
         self.calls.append(project_id)
         return self.snapshot
+
+
+class PinnedSnapshots:
+    def __init__(self, latest: KnowledgeSnapshot, pinned: KnowledgeSnapshot) -> None:
+        self.latest = latest
+        self.pinned = pinned
+        self.exact_calls: list[KnowledgeSnapshot] = []
+
+    async def get(self, project_id: int):
+        return self.latest
+
+    async def get_exact(self, project_id: int, snapshot: KnowledgeSnapshot):
+        self.exact_calls.append(snapshot)
+        return self.pinned
+
+
+class MissingPinnedSnapshots(PinnedSnapshots):
+    async def get_exact(self, project_id: int, snapshot: KnowledgeSnapshot):
+        raise PublishedSnapshotUnavailable("pinned generation was removed")
+
+
+class SnapshotAwareIndex:
+    def __init__(self) -> None:
+        self.calls: list[tuple[KnowledgeSnapshot, str, int, int]] = []
+
+    def search(self, snapshot, question, *, candidate_k=None, context_top_k=None):
+        self.calls.append((snapshot, question, candidate_k, context_top_k))
+        return [source_for(snapshot)]
 
 
 class ScriptedProvider:
@@ -94,6 +137,27 @@ class UsageThenFailProvider:
         return None
 
 
+class FakeLedger:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.records: list[tuple[int, AttemptUsage, str, str | None]] = []
+
+    async def record(self, project_id, attempt, *, outcome, error_code=None):
+        if self.fail:
+            raise RuntimeError("ledger unavailable")
+        self.records.append((project_id, attempt, outcome, error_code))
+        return object()
+
+
+class OneThenHangProvider:
+    async def stream(self, messages):
+        yield CompletionChunk(text="A")
+        await asyncio.Event().wait()
+
+    async def close(self):
+        return None
+
+
 class HangingProvider:
     """Never yields: models a provider that stalls before the first delta."""
 
@@ -114,12 +178,20 @@ class HangingProvider:
         return None
 
 
-def gateway(index, provider, snapshot=SNAPSHOT, config=None) -> RagChatGateway:
+def gateway(
+    index,
+    provider,
+    snapshot=SNAPSHOT,
+    config=None,
+    usage_ledger=None,
+    snapshots=None,
+) -> RagChatGateway:
     return RagChatGateway(
         index=index,
         provider=provider,
-        snapshots=FakeSnapshots(snapshot),
+        snapshots=snapshots if snapshots is not None else FakeSnapshots(snapshot),
         config=config or RagGatewayConfig(candidate_k=5, context_top_k=2, deadline_seconds=5),
+        usage_ledger=usage_ledger,
     )
 
 
@@ -237,6 +309,101 @@ async def test_paid_provider_error_keeps_reported_usage_and_attempt():
     assert raised.value.usage.usage.status is UsageStatus.REPORTED
 
 
+async def test_ledger_records_success_and_paid_error():
+    ledger = FakeLedger()
+    success = gateway(
+        FakeIndex([source()]),
+        ScriptedProvider(
+            [
+                CompletionChunk(text="Ответ [1]"),
+                CompletionChunk(
+                    usage=TokenUsage(
+                        input_tokens=4,
+                        output_tokens=2,
+                        status=UsageStatus.REPORTED,
+                    )
+                ),
+            ]
+        ),
+        usage_ledger=ledger,
+    )
+    await _collect(success.ask_stream(1, "q", "req-1"))
+
+    failure = gateway(
+        FakeIndex([source()]),
+        UsageThenFailProvider(),
+        usage_ledger=ledger,
+    )
+    await _collect(failure.ask_stream(1, "q", "req-1"))
+
+    assert [(record[2], record[3]) for record in ledger.records] == [
+        ("success", None),
+        ("error", "unavailable"),
+    ]
+    assert ledger.records[0][1].usage.status is UsageStatus.REPORTED
+    assert ledger.records[1][1].usage.status is UsageStatus.REPORTED
+    assert ledger.records[1][1].request_id == "req-1"
+
+
+async def test_ledger_failure_does_not_report_success():
+    ledger = FakeLedger(fail=True)
+    g = gateway(
+        FakeIndex([source()]),
+        ScriptedProvider([CompletionChunk(text="Ответ [1]")]),
+        usage_ledger=ledger,
+    )
+
+    events = await _collect(g.ask_stream(1, "q", "req-1"))
+
+    assert events[-1].type is AskEventType.ERROR
+    assert events[-1].error is not None
+    assert events[-1].error.code.value == "unavailable"
+    assert events[-1].result is None
+    assert events[-1].usage is not None
+
+
+async def test_external_cancellation_records_unknown_attempt():
+    ledger = FakeLedger()
+    provider = HangingProvider()
+    g = gateway(FakeIndex([source()]), provider, usage_ledger=ledger)
+    stream = g.ask_stream(1, "q", "req-1")
+
+    first = await anext(stream)
+    assert first.type is AskEventType.STATUS
+    task = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await stream.aclose()
+
+    assert len(ledger.records) == 1
+    assert ledger.records[0][2] == "cancelled"
+    assert ledger.records[0][3] is None
+    assert ledger.records[0][1].usage.status is UsageStatus.UNKNOWN
+    assert ledger.records[0][1].usage.input_tokens is None
+    assert ledger.records[0][1].usage.output_tokens is None
+
+
+async def test_aclose_before_terminal_records_unknown_attempt():
+    ledger = FakeLedger()
+    g = gateway(
+        FakeIndex([source()]),
+        OneThenHangProvider(),
+        usage_ledger=ledger,
+    )
+    stream = g.ask_stream(1, "q", "req-1")
+
+    assert (await anext(stream)).type is AskEventType.STATUS
+    assert (await anext(stream)).type is AskEventType.DELTA
+    await stream.aclose()
+
+    assert len(ledger.records) == 1
+    assert ledger.records[0][2] == "cancelled"
+    assert ledger.records[0][1].usage.status is UsageStatus.UNKNOWN
+    assert ledger.records[0][1].usage.input_tokens is None
+
+
 async def test_invalid_citation_error_keeps_reported_usage():
     provider = ScriptedProvider(
         [
@@ -308,6 +475,39 @@ async def test_published_snapshot_is_required_and_explicit_must_match():
         await explicit.ask(1, "q", snapshot=mismatch)
 
 
+async def test_pinned_snapshot_survives_publication_between_reads():
+    pinned = KnowledgeSnapshot(1, "gen-v1", 1)
+    latest = KnowledgeSnapshot(1, "gen-v2", 2)
+    index = SnapshotAwareIndex()
+    snapshots = PinnedSnapshots(latest=latest, pinned=pinned)
+    g = gateway(
+        index,
+        ScriptedProvider([CompletionChunk(text="Ответ [1]")]),
+        snapshot=pinned,
+        snapshots=snapshots,
+    )
+
+    result = await g.ask(1, "q", snapshot=pinned)
+
+    assert result.snapshot == pinned
+    assert index.calls[0][0] == pinned
+    assert snapshots.exact_calls == [pinned]
+
+
+async def test_pinned_snapshot_removed_fails_closed_without_mixing():
+    pinned = KnowledgeSnapshot(1, "gen-v1", 1)
+    latest = KnowledgeSnapshot(1, "gen-v2", 2)
+    g = gateway(
+        SnapshotAwareIndex(),
+        ScriptedProvider([CompletionChunk(text="Ответ [1]")]),
+        snapshot=pinned,
+        snapshots=MissingPinnedSnapshots(latest=latest, pinned=pinned),
+    )
+
+    with pytest.raises(PublishedSnapshotUnavailable, match="removed"):
+        await g.ask(1, "q", snapshot=pinned)
+
+
 async def test_compat_snapshot_never_passes_as_published():
     compat = KnowledgeSnapshot.compat(1, 3)
     g = gateway(FakeIndex([source()]), ScriptedProvider([]), snapshot=compat)
@@ -316,7 +516,7 @@ async def test_compat_snapshot_never_passes_as_published():
         await g.ask(1, "q")
 
     published = gateway(FakeIndex([source()]), ScriptedProvider([]), snapshot=SNAPSHOT)
-    with pytest.raises(LLMContractError):
+    with pytest.raises(PublishedSnapshotUnavailable, match="compat"):
         await published.ask(1, "q", snapshot=compat)
 
 

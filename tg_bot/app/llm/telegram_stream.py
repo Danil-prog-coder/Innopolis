@@ -17,13 +17,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
-from aiogram.types import InputRichMessage, Message
+from aiogram.types import InputRichMessage, Message, ReplyParameters
 
 from app.llm.gateway import AskEvent, AskEventType, AskResult
 
 logger = logging.getLogger(__name__)
 
 DRAFT_TEXT_LIMIT = 4096
+RICH_MESSAGE_LIMIT = 32768
 DRAFT_PREFIX = "⏳ Предварительный ответ\n\n"
 _URL_PATTERN = re.compile(
     r"(?:[A-Za-z][A-Za-z0-9+.-]*://|www\.|t\.me/)\S*",
@@ -71,6 +72,7 @@ class DeliveryBot(Protocol):
         rich_message: InputRichMessage,
         *,
         message_thread_id: int | None = None,
+        reply_parameters: ReplyParameters | None = None,
     ) -> Message: ...
 
     async def send_message(
@@ -80,6 +82,7 @@ class DeliveryBot(Protocol):
         *,
         parse_mode: None = None,
         message_thread_id: int | None = None,
+        reply_parameters: ReplyParameters | None = None,
     ) -> Message: ...
 
 
@@ -143,12 +146,18 @@ class TelegramStreamDelivery:
         bot: DeliveryBot,
         chat_id: int,
         *,
+        draft_id: int | None = None,
         message_thread_id: int | None = None,
+        reply_parameters: ReplyParameters | None = None,
         policy: DraftPolicy | None = None,
     ) -> None:
+        if draft_id is not None and draft_id < 1:
+            raise ValueError("draft_id must be positive")
         self._bot = bot
         self._chat_id = chat_id
+        self._draft_id = draft_id
         self._thread_id = message_thread_id
+        self._reply_parameters = reply_parameters
         self._policy = policy or DraftPolicy()
 
     async def deliver(
@@ -161,7 +170,11 @@ class TelegramStreamDelivery:
         group: bool = False,
         stop_event: asyncio.Event | None = None,
     ) -> DeliveryOutcome:
-        draft_id = draft_id_for(self._chat_id, request_id)
+        draft_id = (
+            self._draft_id
+            if self._draft_id is not None
+            else draft_id_for(self._chat_id, request_id)
+        )
         loop = asyncio.get_running_loop()
         parts: list[str] = []
         drafts_sent = 0
@@ -203,7 +216,7 @@ class TelegramStreamDelivery:
         aborted = terminal is None and stop_event is not None and stop_event.is_set()
         if terminal is not None and terminal.type is AskEventType.FINAL:
             result = terminal.result
-            if result is not None:
+            if result is not None and result.found and result.answer:
                 fallback = render_fallback(result) if render_fallback is not None else None
                 if await self._send_final(render_final(result), fallback, stop_event):
                     final_sent = True
@@ -247,13 +260,18 @@ class TelegramStreamDelivery:
         fallback: str | None,
         stop_event: asyncio.Event | None,
     ) -> bool:
+        plain = fallback if fallback is not None else (rich.markdown or rich.html or "")
         try:
+            if len(rich.markdown or rich.html or "") > RICH_MESSAGE_LIMIT:
+                await self._send_plain(plain, stop_event)
+                return True
             try:
                 await self._send_with_retry(
                     lambda: self._bot.send_rich_message(
                         self._chat_id,
                         rich,
                         message_thread_id=self._thread_id,
+                        reply_parameters=self._reply_parameters,
                     ),
                     stop_event,
                 )
@@ -262,19 +280,24 @@ class TelegramStreamDelivery:
                 if fallback is None or not _is_rich_format_error(error):
                     raise
                 logger.warning("Rich message rejected in chat %s: %s", self._chat_id, error.message)
-            for part in _split_text(fallback):
-                await self._send_with_retry(
-                    lambda part=part: self._bot.send_message(
-                        self._chat_id,
-                        part,
-                        parse_mode=None,
-                        message_thread_id=self._thread_id,
-                    ),
-                    stop_event,
-                )
+            await self._send_plain(plain, stop_event)
             return True
         except _DeliveryStopped:
             return False
+
+    async def _send_plain(self, text: str, stop_event: asyncio.Event | None) -> None:
+        for index, part in enumerate(_split_text(text)):
+            reply = self._reply_parameters if index == 0 else None
+            await self._send_with_retry(
+                lambda part=part, reply=reply: self._bot.send_message(
+                    self._chat_id,
+                    part,
+                    parse_mode=None,
+                    message_thread_id=self._thread_id,
+                    reply_parameters=reply,
+                ),
+                stop_event,
+            )
 
     async def _send_with_retry(
         self,

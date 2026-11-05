@@ -1,9 +1,9 @@
 """Published snapshot boundary.
 
-PG is the single publication authority (INN-12). The Qdrant manifest remains an
-independent index-integrity check, not a second publish switch. Until INN-12
-exists, production uses the unavailable provider and fails closed; tests may use
-a fake publisher returning an explicit snapshot.
+PG is the single publication authority. The Qdrant manifest remains an
+independent index-integrity check, not a second publish switch. Real mode uses
+the PG-backed provider (``PostgresKnowledgeWork``); the unavailable provider
+stays available for explicit fail-closed contexts and tests.
 """
 
 from typing import Protocol
@@ -18,6 +18,12 @@ class PublishedSnapshotUnavailable(LLMUnavailableError):
 class PublishedSnapshotProvider(Protocol):
     async def get(self, project_id: int) -> KnowledgeSnapshot | None:
         """Return the atomically published snapshot or None."""
+        ...
+
+
+class ExactPublishedSnapshotProvider(Protocol):
+    async def get_exact(self, project_id: int, snapshot: KnowledgeSnapshot) -> KnowledgeSnapshot:
+        """Verify a pinned published snapshot still exists for retrieval."""
         ...
 
 

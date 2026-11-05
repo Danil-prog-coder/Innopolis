@@ -6,6 +6,7 @@
 контракт и безопасная заглушка/фейк.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -786,8 +787,17 @@ class LLMGateway(ABC):
         request_id: str,
         *,
         snapshot: KnowledgeSnapshot | None = None,
+        stop_event: asyncio.Event | None = None,
     ) -> AsyncIterator[AskEvent]:
         """Совместимый final-only путь для реализаций без потоковой генерации."""
+        if stop_event is not None and stop_event.is_set():
+            yield AskEvent(
+                type=AskEventType.CANCELLED,
+                request_id=request_id,
+                seq=1,
+                error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
+            )
+            return
         result = await self.ask(project_id, question, snapshot=snapshot)
         yield AskEvent(type=AskEventType.FINAL, request_id=request_id, seq=1, result=result)
 
