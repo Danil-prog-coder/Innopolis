@@ -24,7 +24,7 @@ from app.services.question_service import Asker
 from app.storage.postgres.models import Project
 
 ASKER = Asker(telegram_id=1002, chat_id=1002, message_id=10)
-FOUND = AskResult(found=True, answer="A")
+FOUND = AskResult(found=True, answer="A", legacy_no_sources=True)
 
 
 @pytest.fixture
@@ -50,10 +50,9 @@ async def test_not_found_creates_question(question_service, fake_llm, project):
     assert (outcome.question.chat_id, outcome.question.message_id) == (1002, 10)
 
 
-async def test_found_with_blank_answer_is_not_found(question_service, fake_llm, project):
-    fake_llm.answer = AskResult(found=True, answer="   ")
-    outcome = await question_service.ask_text(project.id, "Q", ASKER, RateLimitScope.QUESTION)
-    assert outcome.answer is None and outcome.question is not None
+def test_found_with_blank_answer_is_rejected_by_contract():
+    with pytest.raises(ValueError):
+        AskResult(found=True, answer="   ")
 
 
 async def test_not_found_is_not_cached(question_service, fake_llm, project):

@@ -1,6 +1,7 @@
 """Повторяющиеся экраны бота."""
 
 import logging
+import re
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
@@ -33,6 +34,7 @@ from app.core.errors import (
     TooManyAttempts,
 )
 from app.core.security import ProjectPasswordManager
+from app.llm.gateway import LLMContractError, Source
 from app.services.access_service import CurrentProject
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,59 @@ async def send_rich(
     for index, part in enumerate(texts.split_message(fallback)):
         reply = reply_parameters if index == 0 else None
         await bot.send_message(chat_id, part, parse_mode=None, reply_parameters=reply)
+
+
+def with_sources(answer: str, sources: tuple[Source, ...]) -> str:
+    """Добавить к ответу проверенные источники без внутренних id/путей.
+
+    Показываются только citation label, title, section_path и page. Title и
+    section_path недоверенные: они проходят строгий display-фильтр, поэтому
+    Markdown/HTML-ссылки, кнопки и пути из метаданных не исполняются.
+    """
+    if not sources:
+        return answer
+    labels = [source.citation_label for source in sources]
+    if len(set(labels)) != len(labels):
+        raise LLMContractError("citation_label должны быть уникальными")
+    lines: list[str] = []
+    for source in sources:
+        label = _safe_label(source.citation_label)
+        parts = [label, _display_text(source.title, fallback="Источник")]
+        section = _display_text(source.section_path, fallback=None)
+        if section:
+            parts.append(section)
+        if source.page is not None:
+            parts.append(f"стр. {source.page}")
+        lines.append("- " + " — ".join(parts))
+    return f"{answer}\n\n**Источники:**\n" + "\n".join(lines)
+
+
+def _safe_label(value: str) -> str:
+    if not re.fullmatch(r"\[\d{1,3}\]", value):
+        raise LLMContractError("citation_label должен быть строго вида [N]")
+    return value
+
+
+def _display_text(value: str | None, *, fallback: str | None) -> str | None:
+    """Безопасный plain-текст: без Markdown/HTML, URL и локальных путей."""
+    if value is None:
+        return fallback
+    text = " ".join(value.split())
+    if re.search(r"[A-Za-z][A-Za-z0-9+.-]*://|www\.|t\.me/", text, re.IGNORECASE):
+        return fallback
+    if re.search(
+        r"(^|\s)(?:/[^\s]|~[\\/]|[A-Za-z]:[\\/]|\\\\)|file://",
+        text,
+        re.IGNORECASE,
+    ):
+        return fallback
+    # Разрешены буквы/цифры, пробелы и безопасная пунктуация; Markdown/HTML
+    # символы (* _ ` [ ] ( ) < > # | ~ \) удаляются.
+    text = re.sub(r"[^\w\s.,:;!?/«»→—–'\"-]", " ", text, flags=re.UNICODE)
+    text = " ".join(text.replace("_", " ").split()).strip(" -")
+    if not text:
+        return fallback
+    return text[:160]
 
 
 async def bot_username(bot: Bot) -> str:
