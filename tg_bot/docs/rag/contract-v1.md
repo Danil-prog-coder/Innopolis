@@ -173,7 +173,10 @@ class AttemptUsage:
   **не** «billable»: cached/reasoning тоже могут тарифицироваться. Никакого
   повторного сложения cache/reasoning в `total_tokens`.
 - `request_id` общий для retry-попыток; `attempt_id` уникален для попытки.
-  `AskResult.request_id` обязан совпадать с `usage.request_id`.
+  `AskResult.request_id` и `AskEvent.request_id` обязаны совпадать с
+  `usage.request_id`. `attempt_id` выделяется до первого чтения provider;
+  `error`/`cancelled`/timeout/contract violation несут usage, даже если
+  успешного final нет. Если provider не вызывался, attempt не создаётся.
 - `cost` — только reported/reconciled/estimated provider cost (Decimal), не
   расчёт по тарифам. Provenance стоимости (`cost_status`) отделён от статуса
   токенов: известная сумма допустима при unknown counts (например, счёт
@@ -249,6 +252,7 @@ class AskEvent:
     text: str | None = None
     result: AskResult | None = None
     error: AskError | None = None
+    usage: AttemptUsage | None = None  # только ERROR/CANCELLED
 ```
 
 - `delta.text` может быть пробелом, переводом строки или markdown-разметкой;
@@ -258,6 +262,11 @@ class AskEvent:
   совпадает с событием.
 - `error` содержит `AskError` (кроме CANCELLED); `cancelled` — только
   `AskErrorCode.CANCELLED`. Это terminal-события.
+- `usage` допустим только на `error`/`cancelled` и обязан иметь тот же
+  `request_id`. Reported usage сохраняется, если provider успел его прислать;
+  иначе `TokenUsage(status=UNKNOWN)` с counts `None`, не ноль. Для `final`
+  usage лежит в `result.usage`. `consume_stream` переносит usage terminal
+  события в `LLMUnavailableError`/`LLMCancelledError`; это не ledger.
 - `consume_stream(stream, request_id)` проверяет:
   - `request_id` одинаковый, `seq` строго `1,2,3...`;
   - ровно один terminal и он последний; события после terminal запрещены;

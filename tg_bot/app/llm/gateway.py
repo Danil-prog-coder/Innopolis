@@ -148,6 +148,11 @@ class KnowledgeSnapshot:
             knowledge_version=docs_version,
         )
 
+    @property
+    def is_compat(self) -> bool:
+        """``compat`` — переходная заглушка, а не опубликованная generation."""
+        return self.generation_id.startswith("compat-docs-")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "project_id": self.project_id,
@@ -542,7 +547,12 @@ class AskError:
 
 @dataclass(frozen=True, slots=True)
 class AskEvent:
-    """Событие потока. Первый ``final`` терминален; ``error``/``cancelled`` — тоже."""
+    """Событие потока. Первый ``final`` терминален; ``error``/``cancelled`` — тоже.
+
+    ``usage`` относится только к терминальным ``error``/``cancelled``: попытка
+    уже была оплачена, даже если успешного final нет. Для ``final`` usage лежит
+    в ``result.usage``.
+    """
 
     type: AskEventType
     request_id: str
@@ -550,11 +560,20 @@ class AskEvent:
     text: str | None = None
     result: AskResult | None = None
     error: AskError | None = None
+    usage: AttemptUsage | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "type", AskEventType(self.type))
         _text(self.request_id, field="request_id")
         _int(self.seq, field="seq", minimum=1)
+
+        if self.usage is not None:
+            if not isinstance(self.usage, AttemptUsage):
+                raise ValueError("usage должен быть AttemptUsage или None")
+            if self.usage.request_id != self.request_id:
+                raise ValueError("usage.request_id не совпадает с событием")
+            if self.type not in {AskEventType.ERROR, AskEventType.CANCELLED}:
+                raise ValueError("usage допустим только для error/cancelled")
 
         if self.type is AskEventType.STATUS:
             if self.result is not None or self.error is not None:
@@ -583,9 +602,17 @@ class AskEvent:
 
 
 class LLMUnavailableError(Exception):
-    """ИИ-часть недоступна (сеть, таймаут, ошибка сервиса)."""
+    """ИИ-часть недоступна (сеть, таймаут, ошибка сервиса).
+
+    ``usage`` несёт уже полученный provider usage, если вызов состоялся. Это не
+    ledger и не гарантия биллинга; учёт попыток — INN-12.
+    """
 
     retryable = True
+
+    def __init__(self, message: str = "", *, usage: AttemptUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class LLMContractError(LLMUnavailableError):
@@ -605,7 +632,14 @@ class AskStreamContractError(LLMContractError):
 
 
 class _StreamState:
-    __slots__ = ("_request_id", "_next_seq", "_terminal", "_saw_delta", "_result")
+    __slots__ = (
+        "_request_id",
+        "_next_seq",
+        "_terminal",
+        "_saw_delta",
+        "_result",
+        "_terminal_usage",
+    )
 
     def __init__(self, request_id: str) -> None:
         self._request_id = request_id
@@ -613,6 +647,7 @@ class _StreamState:
         self._terminal: AskEventType | None = None
         self._saw_delta = False
         self._result: AskResult | None = None
+        self._terminal_usage: AttemptUsage | None = None
 
     def observe(self, event: AskEvent) -> None:
         if event.request_id != self._request_id:
@@ -633,8 +668,10 @@ class _StreamState:
             self._result = event.result
         elif event.type is AskEventType.ERROR:
             self._terminal = AskEventType.ERROR
+            self._terminal_usage = event.usage
         elif event.type is AskEventType.CANCELLED:
             self._terminal = AskEventType.CANCELLED
+            self._terminal_usage = event.usage
 
     def finish(self) -> AskResult:
         if self._terminal is None:
@@ -644,8 +681,8 @@ class _StreamState:
                 raise AskStreamContractError("final without result")
             return self._result
         if self._terminal is AskEventType.ERROR:
-            raise LLMUnavailableError("stream ended with error")
-        raise LLMCancelledError("stream cancelled")
+            raise LLMUnavailableError("stream ended with error", usage=self._terminal_usage)
+        raise LLMCancelledError("stream cancelled", usage=self._terminal_usage)
 
 
 async def iter_validated_events(
