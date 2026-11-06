@@ -158,6 +158,24 @@ class OneThenHangProvider:
         return None
 
 
+class BlockingProvider:
+    """Yields one delta, then holds the slot until released."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, messages):
+        self.calls += 1
+        self.started.set()
+        yield CompletionChunk(text="Ответ [1]")
+        await self.release.wait()
+
+    async def close(self):
+        return None
+
+
 class HangingProvider:
     """Never yields: models a provider that stalls before the first delta."""
 
@@ -258,6 +276,10 @@ def test_invalid_gateway_config_is_rejected():
         RagGatewayConfig(deadline_seconds=0)
     with pytest.raises(ValueError, match="deadline"):
         RagGatewayConfig(deadline_seconds=float("inf"))
+    with pytest.raises(ValueError, match="max_concurrent_generations"):
+        RagGatewayConfig(max_concurrent_generations=0)
+    with pytest.raises(ValueError, match="max_concurrent_generations"):
+        RagGatewayConfig(max_concurrent_generations=65)
 
 
 async def test_unknown_citation_is_contract_error_not_no_answer():
@@ -614,6 +636,123 @@ async def test_deadline_cancels_hanging_provider_without_final():
 
 async def _collect(stream):
     return [event async for event in stream]
+
+
+async def test_busy_rejects_before_provider_call_or_attempt():
+    provider = BlockingProvider()
+    ledger = FakeLedger()
+    g = gateway(
+        FakeIndex([source()]),
+        provider,
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=5,
+            max_concurrent_generations=1,
+        ),
+        usage_ledger=ledger,
+    )
+    first = asyncio.create_task(_collect(g.ask_stream(1, "q", "req-1")))
+    await asyncio.wait_for(provider.started.wait(), 1)
+    assert g.active_generations == 1
+
+    busy = await _collect(g.ask_stream(1, "q", "req-2"))
+
+    assert [event.type for event in busy] == [AskEventType.ERROR]
+    assert busy[-1].type is AskEventType.ERROR
+    assert busy[-1].error is not None
+    assert busy[-1].error.code is AskErrorCode.BUSY
+    assert busy[-1].usage is None
+    assert provider.calls == 1
+    assert ledger.records == []
+
+    provider.release.set()
+    events = await asyncio.wait_for(first, 1)
+    assert events[-1].type is AskEventType.FINAL
+    assert g.active_generations == 0
+
+    after = await _collect(g.ask_stream(1, "q", "req-3"))
+    assert after[-1].type is AskEventType.FINAL
+    assert g.active_generations == 0
+
+
+async def test_concurrency_limit_allows_configured_number_of_slots():
+    provider = BlockingProvider()
+    g = gateway(
+        FakeIndex([source()]),
+        provider,
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=5,
+            max_concurrent_generations=2,
+        ),
+    )
+    first = asyncio.create_task(_collect(g.ask_stream(1, "q", "req-1")))
+    second = asyncio.create_task(_collect(g.ask_stream(1, "q", "req-2")))
+    await asyncio.wait_for(provider.started.wait(), 1)
+    for _ in range(100):
+        if provider.calls == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert provider.calls == 2
+    assert g.active_generations == 2
+
+    busy = await _collect(g.ask_stream(1, "q", "req-3"))
+    assert busy[-1].error is not None
+    assert busy[-1].error.code is AskErrorCode.BUSY
+    assert provider.calls == 2
+
+    provider.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 1)
+    assert g.active_generations == 0
+
+
+async def test_stop_and_deadline_release_concurrency_slot():
+    provider = BlockingProvider()
+    g = gateway(
+        FakeIndex([source()]),
+        provider,
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=0.02,
+            max_concurrent_generations=1,
+        ),
+    )
+    stop = asyncio.Event()
+    stopped = asyncio.create_task(_collect(g.ask_stream(1, "q", "req-stop", stop_event=stop)))
+    await asyncio.wait_for(provider.started.wait(), 1)
+    stop.set()
+    stop_events = await asyncio.wait_for(stopped, 1)
+    assert stop_events[-1].type is AskEventType.CANCELLED
+    assert g.active_generations == 0
+
+    deadlined = await _collect(g.ask_stream(1, "q", "req-deadline"))
+    assert deadlined[-1].type is AskEventType.ERROR
+    assert deadlined[-1].error is not None
+    assert deadlined[-1].error.code is AskErrorCode.UNAVAILABLE
+    assert g.active_generations == 0
+
+
+async def test_aclose_releases_concurrency_slot():
+    provider = BlockingProvider()
+    g = gateway(
+        FakeIndex([source()]),
+        provider,
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=5,
+            max_concurrent_generations=1,
+        ),
+    )
+    stream = g.ask_stream(1, "q", "req-close")
+    assert (await anext(stream)).type is AskEventType.STATUS
+    assert (await anext(stream)).type is AskEventType.DELTA
+    assert g.active_generations == 1
+    await stream.aclose()
+    assert g.active_generations == 0
 
 
 async def test_provider_failure_is_typed_error_without_final():

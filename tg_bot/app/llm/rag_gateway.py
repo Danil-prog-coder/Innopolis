@@ -13,10 +13,12 @@ import math
 import re
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Protocol
 
 from app.core.enums import DocsMode
+from app.llm.concurrency import ProviderConcurrencyLimiter
 from app.llm.gateway import (
     AskError,
     AskErrorCode,
@@ -77,6 +79,7 @@ class RagGatewayConfig:
     candidate_k: int = 20
     context_top_k: int = 5
     deadline_seconds: float | None = 120.0
+    max_concurrent_generations: int = 1
 
     def __post_init__(self) -> None:
         if self.candidate_k < 1 or self.context_top_k < 1:
@@ -87,6 +90,12 @@ class RagGatewayConfig:
             not math.isfinite(self.deadline_seconds) or self.deadline_seconds <= 0
         ):
             raise ValueError("deadline_seconds должен быть конечным и положительным")
+        if (
+            isinstance(self.max_concurrent_generations, bool)
+            or not isinstance(self.max_concurrent_generations, int)
+            or not 1 <= self.max_concurrent_generations <= 64
+        ):
+            raise ValueError("max_concurrent_generations must be an integer in 1..64")
 
 
 class RagChatGateway(LLMGateway):
@@ -98,12 +107,20 @@ class RagChatGateway(LLMGateway):
         snapshots: PublishedSnapshotProvider,
         config: RagGatewayConfig | None = None,
         usage_ledger: UsageLedger | None = None,
+        limiter: ProviderConcurrencyLimiter | None = None,
     ) -> None:
         self._index = index
         self._provider = provider
         self._snapshots = snapshots
         self._config = config or RagGatewayConfig()
         self._usage_ledger = usage_ledger
+        self._limiter = limiter or ProviderConcurrencyLimiter(
+            self._config.max_concurrent_generations
+        )
+
+    @property
+    def active_generations(self) -> int:
+        return self._limiter.active
 
     async def _resolve_snapshot(
         self, project_id: int, snapshot: KnowledgeSnapshot | None
@@ -327,6 +344,40 @@ class RagChatGateway(LLMGateway):
             )
             return
 
+        if not self._limiter.try_acquire():
+            yield AskEvent(
+                type=AskEventType.ERROR,
+                request_id=request_id,
+                seq=1,
+                error=AskError(code=AskErrorCode.BUSY, retryable=True),
+            )
+            return
+        try:
+            async with aclosing(
+                self._stream_generation(
+                    project_id,
+                    question,
+                    request_id,
+                    resolved,
+                    sources,
+                    stop_event,
+                )
+            ) as events:
+                async for event in events:
+                    yield event
+        finally:
+            self._limiter.release()
+
+    async def _stream_generation(
+        self,
+        project_id: int,
+        question: str,
+        request_id: str,
+        resolved: KnowledgeSnapshot,
+        sources: list[Source],
+        stop_event: asyncio.Event | None,
+    ) -> AsyncIterator[AskEvent]:
+        seq = 0
         seq += 1
         yield AskEvent(type=AskEventType.STATUS, request_id=request_id, seq=seq)
 

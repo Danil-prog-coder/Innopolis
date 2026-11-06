@@ -30,6 +30,7 @@ def client(base_url: str, *, include_usage: bool = False) -> OpenAIStreamClient:
         base_url=base_url,
         api_key="test-key",
         model="test-model",
+        max_output_tokens=512,
         timeout_seconds=5,
         include_usage=include_usage,
     )
@@ -65,6 +66,7 @@ async def test_true_deltas_usage_and_explicit_capability():
     assert seen[0]["model"] == "test-model"
     assert seen[0]["messages"] == [{"role": "user", "content": "q"}]
     assert seen[0]["stream"] is True
+    assert seen[0]["max_tokens"] == 512
     assert seen[0]["stream_options"] == {"include_usage": True}
 
 
@@ -97,6 +99,52 @@ async def test_finish_reason_length_is_incomplete_not_success():
             await collect(client(base_url))
 
 
+@pytest.mark.parametrize(
+    "finish_reason",
+    ["aborted", "insufficient_system_resource", "future_unknown_reason"],
+)
+async def test_non_stop_finish_reason_fails_closed_and_keeps_usage(finish_reason):
+    async def handler(request: web.Request) -> web.Response:
+        body = (
+            'data: {"choices":[{"delta":{"content":"A [1]"},"finish_reason":"'
+            + finish_reason
+            + '"}],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n'
+            "data: [DONE]\n\n"
+        )
+        return web.Response(text=body, content_type="text/event-stream")
+
+    chunks = []
+    async with sse_server(handler) as base_url:
+        with pytest.raises(LLMUnavailableError, match="incomplete"):
+            async for chunk in client(base_url).stream([{"role": "user", "content": "q"}]):
+                chunks.append(chunk)
+
+    assert all(not chunk.text for chunk in chunks)
+    usage = next(chunk.usage for chunk in chunks if chunk.usage is not None)
+    assert usage.status is UsageStatus.REPORTED
+    assert (usage.input_tokens, usage.output_tokens) == (4, 2)
+
+
+async def test_finish_reason_stop_with_usage_is_success():
+    async def handler(request: web.Request) -> web.Response:
+        return web.Response(
+            text=(
+                'data: {"choices":[{"delta":{"content":"A [1]"},"finish_reason":"stop"}],'
+                '"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n'
+                "data: [DONE]\n\n"
+            ),
+            content_type="text/event-stream",
+        )
+
+    async with sse_server(handler) as base_url:
+        chunks = await collect(client(base_url))
+
+    assert [chunk.text for chunk in chunks if chunk.text] == ["A [1]"]
+    usage = next(chunk.usage for chunk in chunks if chunk.usage is not None)
+    assert usage.status is UsageStatus.REPORTED
+    assert (usage.input_tokens, usage.output_tokens) == (4, 2)
+
+
 async def test_missing_done_is_error():
     async def handler(request: web.Request) -> web.Response:
         return web.Response(
@@ -115,6 +163,7 @@ def test_retries_are_disabled_until_attempt_ledger():
             base_url="http://127.0.0.1:1/v1",
             api_key="x",
             model="m",
+            max_output_tokens=128,
             max_retries=1,
         )
 
@@ -125,6 +174,7 @@ def test_missing_provider_configuration_fails_closed(field):
         "base_url": "http://127.0.0.1:1/v1",
         "api_key": "x",
         "model": "m",
+        "max_output_tokens": 128,
     }
     values[field] = " "
     with pytest.raises(ValueError, match="required"):
@@ -138,7 +188,19 @@ def test_invalid_timeout_is_rejected(timeout):
             base_url="http://127.0.0.1:1/v1",
             api_key="x",
             model="m",
+            max_output_tokens=128,
             timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, 131073])
+def test_invalid_max_output_tokens_is_rejected(limit):
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        OpenAIStreamClient(
+            base_url="http://127.0.0.1:1/v1",
+            api_key="x",
+            model="m",
+            max_output_tokens=limit,
         )
 
 
@@ -157,6 +219,7 @@ async def test_custom_chat_completions_path_is_used():
             base_url=base_url,
             api_key="test-key",
             model="DeepSeek-V4.1-Flash-1017",
+            max_output_tokens=256,
             chat_completions_path="/custom/stream",
         )
         chunks = await collect(client)

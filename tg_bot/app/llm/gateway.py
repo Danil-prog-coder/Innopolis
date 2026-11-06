@@ -42,6 +42,7 @@ class NoAnswerReason(StrEnum):
 
 class AskErrorCode(StrEnum):
     UNAVAILABLE = "unavailable"
+    BUSY = "busy"
     CANCELLED = "cancelled"
     CONTRACT_VIOLATION = "contract_violation"
 

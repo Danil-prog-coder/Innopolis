@@ -15,6 +15,8 @@ import aiohttp
 
 from app.llm.gateway import LLMUnavailableError, TokenUsage, UsageStatus
 
+MAX_OUTPUT_TOKENS_LIMIT = 131072
+
 
 @dataclass(frozen=True, slots=True)
 class CompletionChunk:
@@ -90,6 +92,7 @@ class OpenAIStreamClient:
         base_url: str,
         api_key: str,
         model: str,
+        max_output_tokens: int,
         timeout_seconds: float = 60.0,
         max_retries: int = 0,
         include_usage: bool = False,
@@ -105,9 +108,18 @@ class OpenAIStreamClient:
             raise ValueError("timeout_seconds должен быть конечным и положительным")
         if not chat_completions_path.strip():
             raise ValueError("chat_completions_path is required")
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 1 <= max_output_tokens <= MAX_OUTPUT_TOKENS_LIMIT
+        ):
+            raise ValueError(
+                f"max_output_tokens must be an integer in 1..{MAX_OUTPUT_TOKENS_LIMIT}"
+            )
         self._url = f"{base_url.rstrip('/')}/{chat_completions_path.lstrip('/')}"
         self._api_key = api_key
         self._model = model
+        self._max_output_tokens = max_output_tokens
         self._timeout = timeout_seconds
         # Explicit capability: compatible servers may reject stream_options.
         self._include_usage = include_usage
@@ -117,6 +129,9 @@ class OpenAIStreamClient:
             "model": self._model,
             "messages": messages,
             "stream": True,
+            # max_tokens is the common OpenAI-compatible field; provider-specific
+            # alternatives can be added as an explicit capability later.
+            "max_tokens": self._max_output_tokens,
         }
         if self._include_usage:
             payload["stream_options"] = {"include_usage": True}
@@ -162,10 +177,12 @@ class OpenAIStreamClient:
                             continue
                         choice = choices[0] if isinstance(choices[0], dict) else {}
                         finish_reason = choice.get("finish_reason")
-                        if finish_reason in {"length", "content_filter", "tool_calls", "error"}:
-                            raise LLMUnavailableError(
-                                f"provider stream incomplete: {finish_reason}"
-                            )
+                        # Only an explicit "stop" is a successful completion.
+                        # Unknown values (aborted, insufficient_system_resource,
+                        # future provider values) must fail closed instead of
+                        # being cached as a complete answer.
+                        if finish_reason not in (None, "", "stop"):
+                            raise LLMUnavailableError("provider stream incomplete")
                         delta = choice.get("delta", {})
                         content = delta.get("content") if isinstance(delta, dict) else None
                         # reasoning_content intentionally ignored: never expose hidden reasoning.

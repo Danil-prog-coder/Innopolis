@@ -16,6 +16,7 @@ from app.bot.notifier import Notifier
 from app.config import Settings
 from app.core.depends import Depends, DependsResolver
 from app.core.security import ProjectPasswordManager
+from app.llm.concurrency import ProviderConcurrencyLimiter
 from app.llm.gateway import LLMGateway, StubLLMGateway
 from app.llm.openai_stream import OpenAIStreamClient
 from app.llm.published import PublishedSnapshotProvider
@@ -101,6 +102,17 @@ def get_obj_rag_index() -> RagIndex:
 
 
 @cache
+def _provider_limiter(limit: int) -> ProviderConcurrencyLimiter:
+    return ProviderConcurrencyLimiter(limit)
+
+
+def get_obj_provider_limiter(
+    settings: Settings = Depends(get_obj_settings),
+) -> ProviderConcurrencyLimiter:
+    return _provider_limiter(settings.llm_max_concurrent_generations)
+
+
+@cache
 def get_obj_llm_gateway() -> LLMGateway:
     settings = get_obj_settings()
     if settings.rag_mode == "stub":
@@ -113,6 +125,7 @@ def get_obj_llm_gateway() -> LLMGateway:
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key.get_secret_value(),
             model=settings.llm_model,
+            max_output_tokens=settings.llm_max_output_tokens,
             timeout_seconds=settings.llm_timeout_seconds,
             include_usage=settings.llm_include_usage,
             chat_completions_path=settings.llm_chat_completions_path,
@@ -125,8 +138,9 @@ def get_obj_llm_gateway() -> LLMGateway:
         index=get_obj_rag_index(),
         provider=provider,
         snapshots=PostgresKnowledgeWork(client),
-        config=RagGatewayConfig(),
+        config=RagGatewayConfig(max_concurrent_generations=settings.llm_max_concurrent_generations),
         usage_ledger=PostgresUsageLedger(client),
+        limiter=_provider_limiter(settings.llm_max_concurrent_generations),
     )
 
 

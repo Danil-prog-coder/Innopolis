@@ -26,6 +26,7 @@ from app.bot.callbacks import (
 )
 from app.core.enums import DocsMode, MemberRole, QuestionStatus
 from app.dependencies import get_obj_active_draft_registry
+from app.llm.concurrency import ProviderConcurrencyLimiter
 from app.llm.gateway import (
     AskError,
     AskErrorCode,
@@ -34,7 +35,10 @@ from app.llm.gateway import (
     AskResult,
     DocFile,
     KnowledgeSnapshot,
+    Source,
 )
+from app.llm.openai_stream import CompletionChunk
+from app.llm.rag_gateway import RagChatGateway, RagGatewayConfig
 from app.storage.postgres.models import GroupChat, Question
 from tests.bot.conftest import ADMIN_TG, FRESH_TG, OUTSIDER_TG, SECOND_ADMIN_TG, USER_TG
 
@@ -57,6 +61,43 @@ def enable_real_mode(resolver, settings, project_id: int) -> None:
     resolver.overrides[dependencies.get_obj_published_snapshots] = lambda: FixedSnapshots(
         project_id
     )
+
+
+class BotIndex:
+    def __init__(self, project_id: int) -> None:
+        self.project_id = project_id
+
+    def search(self, snapshot, question, *, candidate_k=None, context_top_k=None):
+        assert snapshot.project_id == self.project_id
+        return [
+            Source(
+                project_id=snapshot.project_id,
+                generation_id=snapshot.generation_id,
+                knowledge_version=snapshot.knowledge_version,
+                document_id="doc",
+                document_version="1",
+                chunk_id="chunk",
+                title="test",
+                excerpt="test",
+                citation_label="[1]",
+            )
+        ]
+
+
+class BlockingBotProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, messages):
+        self.calls += 1
+        self.started.set()
+        yield CompletionChunk(text="A [1]")
+        await self.release.wait()
+
+    async def close(self):
+        return None
 
 
 class WaitingStreamingLLM:
@@ -359,6 +400,41 @@ async def test_stop_update_aborts_streaming_final(
 
     assert session.last(SendMessage).text == texts.ANSWER_STOPPED
     assert session.all(SendRichMessage) == []
+
+
+async def test_real_stream_busy_shows_service_busy_without_reprovider(
+    feed, session, resolver, settings, project, user_in_project
+):
+    enable_real_mode(resolver, settings, project.id)
+    provider = BlockingBotProvider()
+    gateway = RagChatGateway(
+        index=BotIndex(project.id),
+        provider=provider,
+        snapshots=FixedSnapshots(project.id),
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=5,
+            max_concurrent_generations=1,
+        ),
+        limiter=ProviderConcurrencyLimiter(1),
+    )
+    resolver.overrides[dependencies.get_obj_llm_gateway] = lambda: gateway
+
+    first = asyncio.create_task(feed.message("busy first", from_user=USER_TG))
+    try:
+        await asyncio.wait_for(provider.started.wait(), 1)
+        await feed.message(
+            "busy second",
+            from_user=USER_TG,
+            message_thread_id=999,
+        )
+        assert session.last(SendMessage).text == texts.SERVICE_BUSY
+        assert provider.calls == 1
+    finally:
+        provider.release.set()
+        if not first.done():
+            await asyncio.wait_for(first, 2)
 
 
 async def test_permission_rich_error_does_not_fall_back(

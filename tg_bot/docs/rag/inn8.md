@@ -71,15 +71,32 @@ Qdrant manifest остаётся `candidate` и проверяется как in
 `app/llm/openai_stream.py` — настраиваемый OpenAI-compatible SSE adapter
 (`/v1/chat/completions`), не заявление о выбранном коммерческом провайдере.
 
-- `base_url`, `model`, `api_key`, `timeout_seconds`, `chat_completions_path`,
-  `include_usage` передаются явно; модель не переписывается.
+- `base_url`, `model`, `api_key`, `timeout_seconds`, `max_output_tokens`,
+  `chat_completions_path`, `include_usage` передаются явно; модель не
+  переписывается.
+- `max_output_tokens` обязателен, проверяется как integer `1..131072` и
+  уходит в OpenAI-compatible payload как `max_tokens`. Это не заявление о
+  provider-specific лимите конкретной модели.
 - `stream: true`, истинные `choices[].delta.content`; успех только после
-  `[DONE]`. `finish_reason=length/content_filter/tool_calls/error` — не успех.
+  `[DONE]`. Любой непустой `finish_reason`, кроме явного `stop`, — не успех:
+  включая `length`, `content_filter`, `tool_calls`, `aborted`,
+  `insufficient_system_resource` и неизвестные значения. Usage из того же
+  события сохраняется перед fail-closed ошибкой.
 - `reasoning_content` игнорируется.
 - `include_usage` — explicit capability; по умолчанию выключена. Пустые
-  `base_url`/`api_key`/`model` и невалидный timeout отклоняются fail-closed.
+  `base_url`/`api_key`/`model`, невалидный timeout и невалидный
+  `max_output_tokens` отклоняются fail-closed.
 - `max_retries != 0` запрещён до explicit attempt ledger/INN-12.
 - Секреты, тело запроса и ответа не логируются.
+
+Одновременные provider generation в процессе ограничены
+`max_concurrent_generations` (`LLM_MAX_CONCURRENT_GENERATIONS`, default 1,
+1..64). В DI лимитер — cached singleton процесса и передаётся в
+`RagChatGateway`; прямые тестовые экземпляры могут иметь свой limiter.
+Занятость — fail-fast: gateway отдаёт terminal `busy` до создания
+`attempt_id`, provider-вызова и ledger-записи. Слот освобождается в `finally`
+для final/error/cancel/timeout/`aclose`/`GeneratorExit`. Это process-local
+лимит; несколько worker требуют общего лимитера.
 
 Целевые модели — DeepSeek-V4.1-Flash-1017 или GLM-5.3-Flash; конкретный
 endpoint ещё не выбран. Реальные capabilities проверяются позже.
@@ -88,6 +105,8 @@ endpoint ещё не выбран. Реальные capabilities проверя�
 
 - `stop_event`/deadline гоняются с pending `anext`; при stop/таймауте pending
   чтение отменяется, upstream закрывается, terminal типизирован.
+- При занятости concurrency-лимита terminal `busy` выдаётся до provider-вызова;
+  `attempt_id`/usage/ledger не создаются.
 - Partial текст не кэшируется и не отдаётся как final.
 - `attempt_id` создаётся до первого чтения provider.
 - `error`/`cancelled`/timeout/contract violation несут `AskEvent.usage` с тем

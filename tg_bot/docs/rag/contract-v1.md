@@ -239,7 +239,7 @@ AttemptUsage(
 ```python
 @dataclass(frozen=True, slots=True)
 class AskError:
-    code: AskErrorCode  # UNAVAILABLE | CANCELLED | CONTRACT_VIOLATION
+    code: AskErrorCode  # UNAVAILABLE | BUSY | CANCELLED | CONTRACT_VIOLATION
     retryable: bool
     detail: str | None = None  # только логи
 
@@ -261,7 +261,9 @@ class AskEvent:
 - `final` содержит result и не содержит error/text; `request_id` результата
   совпадает с событием.
 - `error` содержит `AskError` (кроме CANCELLED); `cancelled` — только
-  `AskErrorCode.CANCELLED`. Это terminal-события.
+  `AskErrorCode.CANCELLED`. Это terminal-события. `BUSY` означает, что
+  process-local concurrency-лимит занят до provider-вызова; такая ошибка не
+  несёт `attempt_id`/usage/ledger-запись.
 - `usage` допустим только на `error`/`cancelled` и обязан иметь тот же
   `request_id`. Reported usage сохраняется, если provider успел его прислать;
   иначе `TokenUsage(status=UNKNOWN)` с counts `None`, не ноль. Для `final`

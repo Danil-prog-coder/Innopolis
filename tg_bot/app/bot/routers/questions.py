@@ -29,7 +29,7 @@ from app.dependencies import (
     get_obj_question_service,
     get_obj_settings,
 )
-from app.llm.gateway import AskEventType, AskResult, LLMUnavailableError
+from app.llm.gateway import AskErrorCode, AskEventType, AskResult, LLMUnavailableError
 from app.llm.telegram_stream import TelegramStreamDelivery
 from app.services.active_draft_registry import ActiveDraftRegistry, DraftAlreadyActive
 from app.services.docs_service import DocsService
@@ -214,7 +214,10 @@ async def _ask_private_realtime(
         await message.answer(texts.ANSWER_STOPPED)
         return
     if terminal.type is AskEventType.ERROR:
-        await message.answer(texts.LLM_UNAVAILABLE)
+        if terminal.error is not None and terminal.error.code is AskErrorCode.BUSY:
+            await message.answer(texts.SERVICE_BUSY)
+        else:
+            await message.answer(texts.LLM_UNAVAILABLE)
         return
     outcome = state.outcome
     if outcome is None:

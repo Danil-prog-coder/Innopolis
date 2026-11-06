@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_api_key: SecretStr = SecretStr("")
     llm_timeout_seconds: float = 60.0
+    llm_max_output_tokens: int = Field(default=1024, ge=1, le=131072)
+    llm_max_concurrent_generations: int = Field(default=1, ge=1, le=64)
     llm_include_usage: bool = False
     llm_chat_completions_path: str = "/chat/completions"
 
