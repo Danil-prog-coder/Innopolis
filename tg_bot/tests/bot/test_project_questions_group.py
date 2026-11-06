@@ -6,6 +6,7 @@ from aiogram.methods import (
     AnswerCallbackQuery,
     DeleteMessage,
     SendMessage,
+    SendMessageDraft,
     SendPhoto,
     SendRichMessage,
     SendRichMessageDraft,
@@ -95,6 +96,15 @@ class BlockingBotProvider:
         self.started.set()
         yield CompletionChunk(text="A [1]")
         await self.release.wait()
+
+    async def close(self):
+        return None
+
+
+class SentinelBotProvider:
+    async def stream(self, messages):
+        yield CompletionChunk(text="NO_")
+        yield CompletionChunk(text="ANSWER")
 
     async def close(self):
         return None
@@ -400,6 +410,34 @@ async def test_stop_update_aborts_streaming_final(
 
     assert session.last(SendMessage).text == texts.ANSWER_STOPPED
     assert session.all(SendRichMessage) == []
+
+
+async def test_real_no_answer_sentinel_does_not_reach_telegram(
+    feed, session, resolver, settings, project, user_in_project
+):
+    enable_real_mode(resolver, settings, project.id)
+    gateway = RagChatGateway(
+        index=BotIndex(project.id),
+        provider=SentinelBotProvider(),
+        snapshots=FixedSnapshots(project.id),
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=5,
+            max_concurrent_generations=1,
+        ),
+        limiter=ProviderConcurrencyLimiter(1),
+    )
+    resolver.overrides[dependencies.get_obj_llm_gateway] = lambda: gateway
+
+    await feed.message("no answer q", from_user=USER_TG)
+
+    assert session.all(SendRichMessage) == []
+    assert session.all(SendRichMessageDraft) == []
+    assert session.all(SendMessageDraft) == []
+    to_user = [m for m in session.all(SendMessage) if m.chat_id == USER_TG.id]
+    assert to_user[-1].text == texts.NOT_FOUND_FORWARDED
+    assert await Question.filter(text="no answer q").exists()
 
 
 async def test_real_stream_busy_shows_service_busy_without_reprovider(

@@ -17,6 +17,7 @@ from app.llm.gateway import (
     Source,
     TokenUsage,
     UsageStatus,
+    iter_validated_events,
 )
 from app.llm.openai_stream import CompletionChunk
 from app.llm.published import PublishedSnapshotUnavailable
@@ -108,13 +109,17 @@ class ScriptedProvider:
         self.chunks = chunks
         self.delay = delay
         self.calls = 0
+        self.closed = False
 
     async def stream(self, messages):
         self.calls += 1
-        for chunk in self.chunks:
-            if self.delay:
-                await asyncio.sleep(self.delay)
-            yield chunk
+        try:
+            for chunk in self.chunks:
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                yield chunk
+        finally:
+            self.closed = True
 
     async def close(self):
         return None
@@ -152,6 +157,21 @@ class FakeLedger:
 class OneThenHangProvider:
     async def stream(self, messages):
         yield CompletionChunk(text="A")
+        await asyncio.Event().wait()
+
+    async def close(self):
+        return None
+
+
+class SentinelThenHangProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+
+    async def stream(self, messages):
+        self.calls += 1
+        yield CompletionChunk(text="NO_")
+        self.started.set()
         await asyncio.Event().wait()
 
     async def close(self):
@@ -267,6 +287,184 @@ async def test_model_no_answer_is_typed_not_answerable_with_usage():
     assert result.no_answer_reason is NoAnswerReason.NOT_ANSWERABLE
     assert result.usage is not None
     assert result.usage.usage.status is UsageStatus.UNKNOWN
+
+
+async def test_no_answer_sentinel_split_case_and_whitespace_is_only_final():
+    ledger = FakeLedger()
+    provider = ScriptedProvider(
+        [
+            CompletionChunk(
+                usage=TokenUsage(
+                    input_tokens=4,
+                    output_tokens=2,
+                    status=UsageStatus.REPORTED,
+                )
+            ),
+            CompletionChunk(text=" No_"),
+            CompletionChunk(text="AnSwEr \n"),
+        ]
+    )
+    g = gateway(FakeIndex([source()]), provider, usage_ledger=ledger)
+
+    events = await _collect(g.ask_stream(1, "q", "req-sentinel"))
+
+    assert [event.type for event in events] == [AskEventType.STATUS, AskEventType.FINAL]
+    final = events[-1].result
+    assert final is not None
+    assert final.found is False
+    assert final.no_answer_reason is NoAnswerReason.NOT_ANSWERABLE
+    assert final.usage is not None
+    assert final.usage.usage.status is UsageStatus.REPORTED
+    assert ledger.records[-1][2:] == ("no_answer", None)
+
+
+async def test_stop_after_first_flushed_delta_cancels_before_next_delta():
+    ledger = FakeLedger()
+    provider = ScriptedProvider(
+        [
+            CompletionChunk(
+                usage=TokenUsage(
+                    input_tokens=5,
+                    output_tokens=1,
+                    status=UsageStatus.REPORTED,
+                )
+            ),
+            CompletionChunk(text="N"),
+            CompletionChunk(text="o"),
+            CompletionChunk(text="t [1]"),
+        ]
+    )
+    g = gateway(FakeIndex([source()]), provider, usage_ledger=ledger)
+    stop = asyncio.Event()
+    stream = g.ask_stream(1, "q", "req-stop-flush", stop_event=stop)
+
+    status = await anext(stream)
+    assert status.type is AskEventType.STATUS
+    first_delta = await anext(stream)
+    assert first_delta.type is AskEventType.DELTA
+    assert first_delta.text == "N"
+
+    stop.set()
+    terminal = await anext(stream)
+
+    assert terminal.type is AskEventType.CANCELLED
+    assert terminal.error is not None
+    assert terminal.error.code is AskErrorCode.CANCELLED
+    assert terminal.usage is not None
+    assert terminal.usage.usage.status is UsageStatus.REPORTED
+    assert (terminal.usage.usage.input_tokens, terminal.usage.usage.output_tokens) == (5, 1)
+    assert ledger.records[-1][2] == "cancelled"
+    assert ledger.records[-1][1].usage.status is UsageStatus.REPORTED
+    assert provider.closed is True
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+async def test_stop_after_last_delta_before_final_cancels():
+    provider = ScriptedProvider([CompletionChunk(text="Hello [1]")])
+    g = gateway(FakeIndex([source()]), provider)
+    stop = asyncio.Event()
+    stream = g.ask_stream(1, "q", "req-stop-final", stop_event=stop)
+
+    assert (await anext(stream)).type is AskEventType.STATUS
+    delta = await anext(stream)
+    assert delta.type is AskEventType.DELTA
+    stop.set()
+    terminal = await anext(stream)
+
+    assert terminal.type is AskEventType.CANCELLED
+    assert terminal.result is None
+
+
+async def test_sentinel_like_text_is_flushed_without_losing_characters():
+    provider = ScriptedProvider([CompletionChunk(text="NO_ANS"), CompletionChunk(text="WER [1]")])
+    g = gateway(FakeIndex([source()]), provider)
+
+    events = await _collect(g.ask_stream(1, "q", "req-1"))
+
+    deltas = [event.text for event in events if event.type is AskEventType.DELTA]
+    assert "".join(deltas) == "NO_ANSWER [1]"
+    assert deltas == ["NO_ANS", "WER [1]"]
+    final = events[-1].result
+    assert final is not None
+    assert final.found is True
+    assert final.answer == "NO_ANSWER [1]"
+
+
+async def test_sentinel_prefix_split_then_normal_text_preserves_original_deltas():
+    provider = ScriptedProvider(
+        [CompletionChunk(text="N"), CompletionChunk(text="o"), CompletionChunk(text="t [1]")]
+    )
+    g = gateway(FakeIndex([source()]), provider)
+
+    events = await _collect(g.ask_stream(1, "q", "req-1"))
+
+    assert [event.text for event in events if event.type is AskEventType.DELTA] == [
+        "N",
+        "o",
+        "t [1]",
+    ]
+    assert events[-1].result is not None
+    assert events[-1].result.answer == "Not [1]"
+
+
+async def test_sentinel_final_through_iter_validated_events_has_no_delta():
+    provider = ScriptedProvider([CompletionChunk(text="no_"), CompletionChunk(text="answer")])
+    g = gateway(FakeIndex([source()]), provider)
+
+    events = [
+        event async for event in iter_validated_events(g.ask_stream(1, "q", "req-1"), "req-1")
+    ]
+
+    assert [event.type for event in events] == [AskEventType.STATUS, AskEventType.FINAL]
+    assert events[-1].result is not None
+    assert events[-1].result.found is False
+
+
+async def test_whitespace_only_stream_is_error_without_delta_or_partial():
+    g = gateway(
+        FakeIndex([source()]),
+        ScriptedProvider([CompletionChunk(text=" \n\t")]),
+    )
+
+    events = await _collect(g.ask_stream(1, "q", "req-1"))
+
+    assert all(event.type is not AskEventType.DELTA for event in events)
+    assert events[-1].type is AskEventType.ERROR
+    assert events[-1].error is not None
+    assert events[-1].error.code is AskErrorCode.UNAVAILABLE
+
+
+async def test_stop_and_deadline_while_sentinel_buffered_do_not_leak_partial():
+    provider = SentinelThenHangProvider()
+    ledger = FakeLedger()
+    g = gateway(FakeIndex([source()]), provider, usage_ledger=ledger)
+    stop = asyncio.Event()
+    task = asyncio.create_task(_collect(g.ask_stream(1, "q", "req-stop", stop_event=stop)))
+    await asyncio.wait_for(provider.started.wait(), 1)
+    stop.set()
+    stopped = await asyncio.wait_for(task, 1)
+
+    assert all(event.type is not AskEventType.DELTA for event in stopped)
+    assert stopped[-1].type is AskEventType.CANCELLED
+    assert ledger.records[-1][2] == "cancelled"
+
+    deadline_provider = SentinelThenHangProvider()
+    deadline = gateway(
+        FakeIndex([source()]),
+        deadline_provider,
+        config=RagGatewayConfig(
+            candidate_k=5,
+            context_top_k=2,
+            deadline_seconds=0.02,
+        ),
+    )
+    timed_out = await _collect(deadline.ask_stream(1, "q", "req-timeout"))
+
+    assert all(event.type is not AskEventType.DELTA for event in timed_out)
+    assert timed_out[-1].type is AskEventType.ERROR
+    assert timed_out[-1].error is not None
+    assert timed_out[-1].error.code is AskErrorCode.UNAVAILABLE
 
 
 def test_invalid_gateway_config_is_rejected():

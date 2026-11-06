@@ -44,6 +44,24 @@ from app.rag.chunking import RagError
 logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+_NO_ANSWER = "no_answer"
+
+
+def _sentinel_state(text: str) -> str:
+    """Whether text can still become the exact NO_ANSWER sentinel.
+
+    ``prefix`` means keep buffering (including leading/trailing whitespace);
+    ``regular`` means this is a normal answer and the original chunks must be
+    released unchanged.
+    """
+    core = text.lstrip().casefold()
+    if not core:
+        return "prefix"
+    if _NO_ANSWER.startswith(core):
+        return "prefix"
+    if core.startswith(_NO_ANSWER) and not core[len(_NO_ANSWER) :].strip():
+        return "prefix"
+    return "regular"
 
 
 class UsageLedger(Protocol):
@@ -397,6 +415,8 @@ class RagChatGateway(LLMGateway):
         # first read so paid errors still carry an attempt id.
         attempt_id = uuid.uuid4().hex
         parts: list[str] = []
+        pending_text: list[str] = []
+        sentinel_pending = True
         usage: TokenUsage | None = None
         usage_recorded = False
 
@@ -405,6 +425,24 @@ class RagChatGateway(LLMGateway):
                 request_id=request_id,
                 attempt_id=attempt_id,
                 usage=usage if usage is not None else TokenUsage(status=UsageStatus.UNKNOWN),
+            )
+
+        async def cancelled_event() -> AskEvent | None:
+            nonlocal seq, usage_recorded
+            if stop_event is None or not stop_event.is_set():
+                return None
+            close = getattr(iterator, "aclose", None)
+            if close is not None:
+                await close()
+            attempt = attempt_usage()
+            usage_recorded = await self._record_usage(project_id, attempt, outcome="cancelled")
+            seq += 1
+            return AskEvent(
+                type=AskEventType.CANCELLED,
+                request_id=request_id,
+                seq=seq,
+                error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
+                usage=attempt,
             )
 
         iterator = self._provider.stream(self._messages(question, sources)).__aiter__()
@@ -483,13 +521,35 @@ class RagChatGateway(LLMGateway):
                     usage = chunk.usage
                 if chunk.text:
                     parts.append(chunk.text)
-                    seq += 1
-                    yield AskEvent(
-                        type=AskEventType.DELTA,
-                        request_id=request_id,
-                        seq=seq,
-                        text=chunk.text,
-                    )
+                    if sentinel_pending:
+                        pending_text.append(chunk.text)
+                        if _sentinel_state("".join(pending_text)) == "regular":
+                            for pending in pending_text:
+                                event = await cancelled_event()
+                                if event is not None:
+                                    yield event
+                                    return
+                                seq += 1
+                                yield AskEvent(
+                                    type=AskEventType.DELTA,
+                                    request_id=request_id,
+                                    seq=seq,
+                                    text=pending,
+                                )
+                            event = await cancelled_event()
+                            if event is not None:
+                                yield event
+                                return
+                            pending_text.clear()
+                            sentinel_pending = False
+                    else:
+                        seq += 1
+                        yield AskEvent(
+                            type=AskEventType.DELTA,
+                            request_id=request_id,
+                            seq=seq,
+                            text=chunk.text,
+                        )
         except asyncio.CancelledError:
             # The consumer can cancel the generator before a terminal event.
             # The provider call may already be paid, so record it here.
@@ -514,6 +574,11 @@ class RagChatGateway(LLMGateway):
             if close is not None:
                 await close()
 
+        event = await cancelled_event()
+        if event is not None:
+            yield event
+            return
+
         answer = "".join(parts).strip()
         if not answer:
             attempt = attempt_usage()
@@ -532,7 +597,7 @@ class RagChatGateway(LLMGateway):
                 usage=attempt,
             )
             return
-        if answer.casefold() == "no_answer":
+        if answer.casefold() == _NO_ANSWER:
             attempt = attempt_usage()
             usage_recorded = await self._record_usage(project_id, attempt, outcome="no_answer")
             if not usage_recorded:
@@ -560,6 +625,27 @@ class RagChatGateway(LLMGateway):
                 ),
             )
             return
+        if sentinel_pending and pending_text:
+            # The answer only looked like the sentinel for a while; release the
+            # original chunks without losing whitespace or characters.
+            for pending in pending_text:
+                event = await cancelled_event()
+                if event is not None:
+                    yield event
+                    return
+                seq += 1
+                yield AskEvent(
+                    type=AskEventType.DELTA,
+                    request_id=request_id,
+                    seq=seq,
+                    text=pending,
+                )
+            event = await cancelled_event()
+            if event is not None:
+                yield event
+                return
+            pending_text.clear()
+            sentinel_pending = False
         try:
             self._citations(answer, sources)
         except LLMContractError:

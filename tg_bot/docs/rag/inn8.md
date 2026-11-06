@@ -1,8 +1,8 @@
 # INN-8: публикация snapshot, real gateway и usage ledger
 
 Статус: реализован минимальный безопасный срез publication + real gateway +
-persistent attempt ledger + private-chat streaming draft/final/stop. **INN-8 не
-закрыт**: migration/CAS не проверены на реальном PostgreSQL, live
+persistent attempt ledger + private-chat streaming draft/final/stop. Миграция и
+CAS проверены на изолированном PostgreSQL. **INN-8 не закрыт**: live
 provider/Telegram тесты не выполнялись, групповая ACL (INN-10) не реализована —
 real-mode группы fail-closed.
 
@@ -108,6 +108,11 @@ endpoint ещё не выбран. Реальные capabilities проверя�
 - При занятости concurrency-лимита terminal `busy` выдаётся до provider-вызова;
   `attempt_id`/usage/ledger не создаются.
 - Partial текст не кэшируется и не отдаётся как final.
+- Пока вывод может оказаться sentinel `NO_ANSWER`, gateway буферизует исходные
+  чанки. Точный sentinel после strip/casefold (включая разбиение по чанкам и
+  пробелы) превращается в один `final found=false` без delta. Если текст
+  расходится с sentinel, буфер выдаётся исходными delta без потери символов.
+  Stop/error/timeout не выливают буфер и не сохраняют partial.
 - `attempt_id` создаётся до первого чтения provider.
 - `error`/`cancelled`/timeout/contract violation несут `AskEvent.usage` с тем
   же `request_id`: reported usage, если provider успел его прислать, иначе
@@ -169,6 +174,9 @@ chat+thread+actor в обоих случаях.
 
 ## Проверки
 
+Подготовка отдельной среды и будущий live-сценарий описаны в
+[live-smoke.md](live-smoke.md).
+
 Локально без Docker/рабочих БД:
 
 ```bash
@@ -184,19 +192,19 @@ private streaming stop через update/`/stop`, stop из чужого chat/ac
 ids, stale/unregister, real-mode group ACL fail-closed.
 
 Postgres-only concurrent publish test помечен skip без `TEST_POSTGRES_URL`.
-Реальный Postgres/Redis и live provider **не проверены**: Docker не отвечает,
-рабочие БД и Redis DB0 не используются.
+На изолированном PostgreSQL 16 проверены миграции, повторный upgrade, откат,
+конкурентная публикация и ledger; 14 тестов publication/ledger/migration
+прошли на отдельном PostgreSQL. Это не подтверждает live provider/Telegram.
+Рабочие БД и Redis DB0 для этих проверок не использовались.
 
 ## Остаётся
 
-1. Проверить migration и CAS на выделенной одноразовой Postgres БД; Docker
-   сейчас не отвечает, поэтому эта часть **не закрыта**.
-2. Выбрать endpoint/ключ, проверить `include_usage` и выполнить real provider
+1. Выбрать endpoint/ключ, проверить `include_usage` и выполнить real provider
    test; live Telegram streaming/stop test с отдельным token.
-3. INN-10: авторизация/аудитория group answers. До неё real-mode группы
+2. INN-10: авторизация/аудитория group answers. До неё real-mode группы
    fail-closed.
-4. Полный INN-12: outbox/reconciliation ledger, corpus storage для честного
+3. Полный INN-12: outbox/reconciliation ledger, corpus storage для честного
    APPEND, retention/агрегация. Повторная загрузка после неоднозначного
    ответа не идемпотентна и может опубликовать следующую version.
-5. Process-local stop registry: для multi-worker нужен общий сигнал.
-6. Строгая groundedness-проверка цитат.
+4. Process-local stop registry: для multi-worker нужен общий сигнал.
+5. Строгая groundedness-проверка цитат.
