@@ -28,6 +28,9 @@ async def main() -> None:
     redis = get_obj_redis_client()
     await postgres.connect()
     await redis.connect()
+    # RAG_MODE=real must fail closed before polling if provider/Qdrant config is
+    # incomplete. Stub mode is an explicit dev/test choice.
+    llm_gateway = get_obj_llm_gateway()
 
     bot = get_obj_bot()
     resolver = get_obj_resolver()
@@ -40,7 +43,7 @@ async def main() -> None:
     finally:
         await scheduler.stop()
         await get_obj_notifier().shutdown()
-        await get_obj_llm_gateway().close()
+        await llm_gateway.close()
         await redis.close()
         await postgres.close()
         await bot.session.close()

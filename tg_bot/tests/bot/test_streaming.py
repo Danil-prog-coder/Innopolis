@@ -150,6 +150,25 @@ async def test_registry_stop():
     assert registry.stop(1, 2) is False  # уже остановлена
 
 
+async def test_registry_stop_context_is_thread_and_actor_scoped():
+    registry = GenerationRegistry()
+    first = asyncio.ensure_future(asyncio.sleep(10))
+    second = asyncio.ensure_future(asyncio.sleep(10))
+    registry.add(1, 10, first, thread_id=5, actor_user_id=1)
+    registry.add(1, 11, second, thread_id=6, actor_user_id=1)
+    try:
+        assert registry.stop_context(chat_id=1, thread_id=5, actor_user_id=2) is False
+        assert not first.cancelled() and not second.cancelled()
+        assert registry.stop_context(chat_id=1, thread_id=5, actor_user_id=1) is True
+        await asyncio.sleep(0)
+        assert first.cancelled()
+        assert not second.cancelled()
+    finally:
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+
+
 async def test_registry_discard_keeps_newer_task():
     registry = GenerationRegistry()
     old, new = asyncio.ensure_future(asyncio.sleep(0)), asyncio.ensure_future(asyncio.sleep(0))
@@ -253,7 +272,7 @@ async def test_stop_during_replay_returns_none():
 
 
 async def test_private_answer_is_streamed_as_drafts(feed, session, fake_llm, user_in_project):
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     message = await feed.message("как сохранить?", from_user=USER_TG)
 
     thinking = session.all(SendMessageDraft)[0]
@@ -267,7 +286,8 @@ async def test_private_answer_is_streamed_as_drafts(feed, session, fake_llm, use
     assert all(d.count("**") % 2 == 0 for d in drafts)  # оборванная разметка не протекает
 
     final = session.last(SendRichMessage)
-    assert final.rich_message.markdown == ANSWER
+    assert final.rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in final.rich_message.markdown
     last_draft = session.all(SendRichMessageDraft)[-1]
     assert session.requests.index(final) > session.requests.index(last_draft)
     assert session.all(SendChatAction) == []
@@ -277,34 +297,37 @@ async def test_streaming_disabled_answers_as_before(
     feed, session, fake_llm, settings, user_in_project
 ):
     settings.answer_streaming_enabled = False
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     await feed.message("как сохранить?", from_user=USER_TG)
     assert session.all(SendMessageDraft) == [] and session.all(SendRichMessageDraft) == []
     assert session.last(SendChatAction).action == "typing"
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_rejected_rich_draft_falls_back_to_plain_draft(
     feed, session, fake_llm, user_in_project
 ):
     session.failing_methods.add("SendRichMessageDraft")
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     await feed.message("как сохранить?", from_user=USER_TG)
     assert len(session.all(SendRichMessageDraft)) == 1  # после отказа rich больше не пробуем
     plain = [d.text for d in session.all(SendMessageDraft) if d.text]
     assert len(plain) == 2
     full = "Как сохранить\n\nНажмите Сохранить в правом верхнем углу экрана настроек"
     assert all(full.startswith(text) and "**" not in text and "#" not in text for text in plain)
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_drafts_unavailable_still_answers(feed, session, fake_llm, user_in_project):
     session.failing_methods.update({"SendMessageDraft", "SendRichMessageDraft"})
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     await feed.message("как сохранить?", from_user=USER_TG)
     assert len(session.all(SendMessageDraft)) == 1  # после отказа черновики не шлём
     assert session.all(SendRichMessageDraft) == []
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_private_not_found_has_no_answer_drafts(feed, session, user_in_project):
@@ -321,23 +344,24 @@ async def test_private_llm_down(feed, session, fake_llm, user_in_project):
 
 
 async def test_screenshot_answer_is_streamed(feed, session, fake_llm, user_in_project):
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     await feed.message(photo=True, from_user=USER_TG)
     assert session.all(SendRichMessageDraft)
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_stop_button_cancels_generation(feed, session, fake_llm, user_in_project, dp, bot):
     started, cancelled = asyncio.Event(), asyncio.Event()
 
-    async def slow_ask(project_id, question):
+    async def slow_ask(project_id, question, *, snapshot=None):
         started.set()
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
             cancelled.set()
             raise
-        return AskResult(found=True, answer=ANSWER)
+        return AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
 
     fake_llm.ask = slow_ask
     asking = asyncio.create_task(feed.message("как сохранить?", from_user=USER_TG))
@@ -356,10 +380,13 @@ async def test_stop_button_cancels_generation(feed, session, fake_llm, user_in_p
 async def test_stop_for_other_chat_is_ignored(feed, session, fake_llm, user_in_project, dp, bot):
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def slow_ask(project_id, question):
+    async def slow_ask(project_id, question, *, snapshot=None):
         started.set()
         await release.wait()
-        return AskResult(found=True, answer=ANSWER)
+        return fake_llm._with_scope(
+            AskResult(found=True, answer=ANSWER, legacy_no_sources=True),
+            snapshot,
+        )
 
     fake_llm.ask = slow_ask
     asking = asyncio.create_task(feed.message("как сохранить?", from_user=USER_TG))
@@ -370,11 +397,12 @@ async def test_stop_for_other_chat_is_ignored(feed, session, fake_llm, user_in_p
     await dp.feed_update(bot, _stopped(USER_TG.id + 1, draft.draft_id))
     release.set()
     await asyncio.wait_for(asking, 1)
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_stop_after_answer_is_noop(feed, session, fake_llm, user_in_project, dp, bot):
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     message = await feed.message("как сохранить?", from_user=USER_TG)
     session.clear()
     await dp.feed_update(bot, _stopped(USER_TG.id, message.message_id))
@@ -387,7 +415,7 @@ async def test_stop_after_answer_is_noop(feed, session, fake_llm, user_in_projec
 async def test_group_answer_is_streamed_by_editing_placeholder(
     feed, session, fake_llm, bound_group
 ):
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     session.clear()
     question = await _ask_in_group(feed)
 
@@ -401,7 +429,9 @@ async def test_group_answer_is_streamed_by_editing_placeholder(
 
     deleted = session.last(DeleteMessage)
     final = session.last(SendRichMessage)
-    assert final.chat_id == GROUP and final.rich_message.markdown == ANSWER
+    assert final.chat_id == GROUP
+    assert final.rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in final.rich_message.markdown
     assert session.requests.index(deleted) < session.requests.index(final)
 
 
@@ -416,18 +446,20 @@ async def test_group_not_found_removes_placeholder(feed, session, bound_group):
 
 async def test_group_edit_failure_still_answers(feed, session, fake_llm, bound_group):
     session.failing_methods.add("EditMessageText")
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     await _ask_in_group(feed)
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 async def test_group_streaming_disabled(feed, session, fake_llm, settings, bound_group):
     settings.answer_streaming_enabled = False
-    fake_llm.answer = AskResult(found=True, answer=ANSWER)
+    fake_llm.answer = AskResult(found=True, answer=ANSWER, legacy_no_sources=True)
     session.clear()
     await _ask_in_group(feed)
     assert session.all(SendMessage) == [] and session.all(DeleteMessage) == []
-    assert session.last(SendRichMessage).rich_message.markdown == ANSWER
+    assert session.last(SendRichMessage).rich_message.markdown.startswith(ANSWER)
+    assert "**Источники:**" in session.last(SendRichMessage).rich_message.markdown
 
 
 def test_stream_timing_frames():

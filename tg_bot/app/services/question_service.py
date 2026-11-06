@@ -1,11 +1,15 @@
+import asyncio
 import logging
-from dataclasses import dataclass
+from collections.abc import AsyncIterator
+from contextlib import aclosing
+from dataclasses import dataclass, replace
 
 from app.config import Settings
 from app.core.clock import Clock, utc_now
 from app.core.enums import MemberRole, QuestionStatus, RateLimitScope
 from app.core.errors import (
     EmptyQuestion,
+    GroupAnswersUnavailable,
     ProjectNotFound,
     QuestionAlreadyAnswered,
     QuestionNotAnswered,
@@ -14,6 +18,10 @@ from app.core.errors import (
     RateLimited,
 )
 from app.llm.gateway import (
+    AskError,
+    AskErrorCode,
+    AskEvent,
+    AskEventType,
     AskResult,
     KnowledgeSnapshot,
     LLMContractError,
@@ -21,6 +29,7 @@ from app.llm.gateway import (
     NoAnswerReason,
     Source,
 )
+from app.llm.published import PublishedSnapshotProvider, PublishedSnapshotUnavailable
 from app.services.access_service import AccessGuard
 from app.storage.postgres.membership_work import PostgresMembershipWork
 from app.storage.postgres.models import Project, Question, User
@@ -54,6 +63,13 @@ class AskOutcome:
     no_answer_reason: NoAnswerReason | None = None
 
 
+@dataclass(slots=True)
+class AskStreamState:
+    """Заполняется streaming-сервисом до terminal; читается router после."""
+
+    outcome: AskOutcome | None = None
+
+
 class QuestionService:
     MAX_QUESTION_LEN = 4000
     MAX_ANSWER_LEN = 4000
@@ -69,6 +85,7 @@ class QuestionService:
         access_guard: AccessGuard,
         settings: Settings,
         clock: Clock = utc_now,
+        snapshots: PublishedSnapshotProvider | None = None,
     ) -> None:
         self._llm = llm_gateway
         self._cache = answer_cache_work
@@ -79,15 +96,22 @@ class QuestionService:
         self._access = access_guard
         self._settings = settings
         self._clock = clock
+        # None — explicit stub/legacy mode. Real mode must inject the PG
+        # published-snapshot provider, never fall back to compat.
+        self._snapshots = snapshots
 
     async def ask_text(
         self, project_id: int, text: str, asker: Asker, scope: RateLimitScope
     ) -> AskOutcome:
+        # INN-10 is not closed: one group password/chat_id is not an audience
+        # ACL. Real documentation answers stay private-only until then.
+        if scope is RateLimitScope.GROUP_QUESTION and self._settings.rag_mode == "real":
+            raise GroupAnswersUnavailable
         text = self._validate(text)
         await self._check_rate(scope, asker)
         project = await self._get_project(project_id)
         # Snapshot фиксируется до retrieval и не перечитывается после ответа.
-        snapshot = KnowledgeSnapshot.compat(project.id, project.docs_version)
+        snapshot = await self._snapshot(project)
 
         cached = await self._cache.get(project.id, snapshot.knowledge_version, text)
         if cached is not None:
@@ -116,6 +140,117 @@ class QuestionService:
             no_answer_reason=result.no_answer_reason,
         )
 
+    async def ask_text_stream(
+        self,
+        project_id: int,
+        text: str,
+        asker: Asker,
+        scope: RateLimitScope,
+        *,
+        request_id: str,
+        state: AskStreamState,
+        stop_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[AskEvent]:
+        """Streaming-вариант ask_text с тем же cache/no-answer контрактом."""
+        if scope is RateLimitScope.GROUP_QUESTION and self._settings.rag_mode == "real":
+            raise GroupAnswersUnavailable
+        text = self._validate(text)
+        await self._check_rate(scope, asker)
+        project = await self._get_project(project_id)
+        snapshot = await self._snapshot(project)
+
+        if stop_event is not None and stop_event.is_set():
+            yield AskEvent(
+                type=AskEventType.CANCELLED,
+                request_id=request_id,
+                seq=1,
+                error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
+            )
+            return
+
+        cached = await self._cache.get(project.id, snapshot.knowledge_version, text)
+        if stop_event is not None and stop_event.is_set():
+            yield AskEvent(
+                type=AskEventType.CANCELLED,
+                request_id=request_id,
+                seq=1,
+                error=AskError(code=AskErrorCode.CANCELLED, retryable=False),
+            )
+            return
+        if cached is not None:
+            cached_result = self._cached_result(cached, snapshot)
+            if cached_result is not None:
+                state.outcome = AskOutcome(
+                    answer=cached_result.answer,
+                    sources=cached_result.sources,
+                    snapshot=snapshot,
+                )
+                yield AskEvent(
+                    type=AskEventType.FINAL,
+                    request_id=request_id,
+                    seq=1,
+                    result=cached_result,
+                )
+                return
+
+        events = self._llm.ask_stream(
+            project.id,
+            text,
+            request_id,
+            snapshot=snapshot,
+            stop_event=stop_event,
+        )
+        async with aclosing(events) as stream:
+            async for event in stream:
+                if event.type is AskEventType.FINAL:
+                    result = event.result
+                    if result is None:
+                        yield AskEvent(
+                            type=AskEventType.ERROR,
+                            request_id=request_id,
+                            seq=event.seq,
+                            error=AskError(
+                                code=AskErrorCode.CONTRACT_VIOLATION,
+                                retryable=False,
+                            ),
+                        )
+                        return
+                    try:
+                        checked = self._checked_result(result, snapshot)
+                    except LLMContractError:
+                        yield AskEvent(
+                            type=AskEventType.ERROR,
+                            request_id=request_id,
+                            seq=event.seq,
+                            error=AskError(
+                                code=AskErrorCode.CONTRACT_VIOLATION,
+                                retryable=False,
+                            ),
+                            usage=result.usage,
+                        )
+                        return
+                    if checked.found:
+                        await self._cache.set(
+                            project.id,
+                            snapshot.knowledge_version,
+                            text,
+                            checked.to_cache_json(),
+                        )
+                        state.outcome = AskOutcome(
+                            answer=checked.answer,
+                            sources=checked.sources,
+                            snapshot=snapshot,
+                        )
+                    else:
+                        state.outcome = AskOutcome(
+                            question=await self._save_question(project.id, text, asker, None),
+                            snapshot=snapshot,
+                            no_answer_reason=checked.no_answer_reason,
+                        )
+                    if checked is not result:
+                        event = replace(event, result=checked)
+                yield event
+
     async def ask_image(
         self,
         project_id: int,
@@ -129,7 +264,7 @@ class QuestionService:
             raise QuestionTooLong
         await self._check_rate(RateLimitScope.QUESTION, asker)
         project = await self._get_project(project_id)
-        snapshot = KnowledgeSnapshot.compat(project.id, project.docs_version)
+        snapshot = await self._snapshot(project)
 
         result = await self._llm.ask_image(project.id, image, caption, snapshot=snapshot)
         result = self._checked_result(result, snapshot)
@@ -202,6 +337,16 @@ class QuestionService:
         if project is None:
             raise ProjectNotFound
         return project
+
+    async def _snapshot(self, project: Project) -> KnowledgeSnapshot:
+        if self._snapshots is None:
+            return KnowledgeSnapshot.compat(project.id, project.docs_version)
+        snapshot = await self._snapshots.get(project.id)
+        if snapshot is None:
+            raise PublishedSnapshotUnavailable("project has no published knowledge generation")
+        if snapshot.project_id != project.id:
+            raise PublishedSnapshotUnavailable("published snapshot project mismatch")
+        return snapshot
 
     @staticmethod
     def _cached_result(raw: str, snapshot: KnowledgeSnapshot) -> AskResult | None:

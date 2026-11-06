@@ -277,13 +277,26 @@ class GenerationRegistry:
 
     def __init__(self) -> None:
         self._tasks: dict[tuple[int, int], asyncio.Task[AskOutcome]] = {}
+        self._meta: dict[tuple[int, int], tuple[int | None, int | None]] = {}
 
-    def add(self, chat_id: int, draft_id: int, task: asyncio.Task[AskOutcome]) -> None:
-        self._tasks[(chat_id, draft_id)] = task
+    def add(
+        self,
+        chat_id: int,
+        draft_id: int,
+        task: asyncio.Task[AskOutcome],
+        *,
+        thread_id: int | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        key = (chat_id, draft_id)
+        self._tasks[key] = task
+        self._meta[key] = (thread_id, actor_user_id)
 
     def discard(self, chat_id: int, draft_id: int, task: asyncio.Task[AskOutcome]) -> None:
-        if self._tasks.get((chat_id, draft_id)) is task:
-            del self._tasks[(chat_id, draft_id)]
+        key = (chat_id, draft_id)
+        if self._tasks.get(key) is task:
+            del self._tasks[key]
+            self._meta.pop(key, None)
 
     def stop(self, chat_id: int, draft_id: int) -> bool:
         """``False`` — такой генерации нет или она уже закончилась."""
@@ -292,6 +305,24 @@ class GenerationRegistry:
             return False
         task.cancel()
         return True
+
+    def stop_context(
+        self,
+        *,
+        chat_id: int,
+        thread_id: int | None,
+        actor_user_id: int | None,
+    ) -> bool:
+        """Cancel replay tasks in the same chat/thread/actor context."""
+        stopped = False
+        for key, task in list(self._tasks.items()):
+            if key[0] != chat_id or task.done():
+                continue
+            if self._meta.get(key) != (thread_id, actor_user_id):
+                continue
+            task.cancel()
+            stopped = True
+        return stopped
 
     def __len__(self) -> int:
         return len(self._tasks)
@@ -369,6 +400,7 @@ async def stream_answer(
     timing: StreamTiming,
     registry: GenerationRegistry | None = None,
     stop_key: tuple[int, int] | None = None,
+    stop_meta: tuple[int | None, int | None] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> AskOutcome | None:
     """Получить ответ, показывая его по ходу. ``None`` — пользователь нажал «Стоп».
@@ -378,7 +410,13 @@ async def stream_answer(
     """
     task = asyncio.ensure_future(_generate(preview, ask, timing, sleep))
     if registry is not None and stop_key is not None:
-        registry.add(*stop_key, task)
+        thread_id, actor_user_id = stop_meta or (None, None)
+        registry.add(
+            *stop_key,
+            task,
+            thread_id=thread_id,
+            actor_user_id=actor_user_id,
+        )
     try:
         await asyncio.wait({task})
     except asyncio.CancelledError:

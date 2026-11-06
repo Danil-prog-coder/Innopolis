@@ -87,6 +87,11 @@ async def _ask(
     if project is None:
         await message.reply(texts.group_not_bound(await views.bot_username(bot)))
         return
+    if settings.rag_mode == "real":
+        # INN-10 is not closed: one group password/chat_id is not an audience ACL.
+        # No placeholder, no retrieval, no provider call.
+        await message.reply(texts.GROUP_ANSWERS_UNAVAILABLE)
+        return
     asker = Asker(message.from_user.id, message.chat.id, message.message_id)
 
     def ask() -> Awaitable[AskOutcome]:

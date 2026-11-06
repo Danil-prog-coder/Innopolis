@@ -58,13 +58,14 @@ class MockedSession(BaseSession):
         self.file_content = b"file-bytes"
         # Имена методов Bot API, которые должны падать с TelegramBadRequest
         self.failing_methods: set[str] = set()
+        self.failing_message = "not enough rights"
 
     # Сигнатуры make_request/stream_content задаёт BaseSession aiogram
     async def make_request(self, bot: Bot, method: TelegramMethod[Any], timeout: int | None = None):
         self.requests.append(method)
         name = type(method).__name__
         if name in self.failing_methods:
-            raise TelegramBadRequest(method=method, message="not enough rights")
+            raise TelegramBadRequest(method=method, message=self.failing_message)
         if isinstance(method, GetMe):
             return BOT_TG
         if isinstance(method, GetFile):
@@ -140,10 +141,13 @@ class Feeder:
         document: dict | None = None,
         photo: bool = False,
         caption: str | None = None,
+        message_thread_id: int | None = None,
     ) -> Message:
         fields: dict[str, Any] = {}
         if text is not None:
             fields["text"] = text
+        if message_thread_id is not None:
+            fields["message_thread_id"] = message_thread_id
         if entities:
             fields["entities"] = [MessageEntity(**e) for e in entities]
         if document:

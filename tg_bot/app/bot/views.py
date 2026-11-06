@@ -15,6 +15,7 @@ from app.core.errors import (
     DomainError,
     EmptyQuestion,
     FileTooLarge,
+    GroupAnswersUnavailable,
     GroupRebindForbidden,
     InvalidPassword,
     InvalidProjectName,
@@ -62,6 +63,7 @@ ERROR_TEXTS: dict[type[DomainError], str] = {
     DocUpdateNotFound: texts.CHANGES_NOT_FOUND,
     RemovedFromProject: texts.REMOVED_FROM_PROJECT_BEFORE,
     GroupRebindForbidden: texts.GROUP_REBIND_FORBIDDEN,
+    GroupAnswersUnavailable: texts.GROUP_ANSWERS_UNAVAILABLE,
 }
 
 

@@ -1,6 +1,7 @@
 from app.core.enums import DocsMode
 from app.core.errors import DocUpdateNotFound, FileTooLarge, NoFilesToUpload
 from app.llm.gateway import DocFile, LLMGateway
+from app.rag.ingestion import RagIngestionService
 from app.services.access_service import AccessGuard
 from app.storage.postgres.doc_update_work import PostgresDocUpdateWork
 from app.storage.postgres.membership_work import PostgresMembershipWork
@@ -19,12 +20,16 @@ class DocsService:
         doc_update_work: PostgresDocUpdateWork,
         membership_work: PostgresMembershipWork,
         access_guard: AccessGuard,
+        knowledge_publisher: RagIngestionService | None = None,
     ) -> None:
         self._llm = llm_gateway
         self._project_work = project_work
         self._doc_update_work = doc_update_work
         self._membership_work = membership_work
         self._access = access_guard
+        # Real mode uses verified candidate -> PG CAS publication. The legacy
+        # fake/stub path stays explicit and never claims a published generation.
+        self._knowledge_publisher = knowledge_publisher
 
     @classmethod
     def check_file_size(cls, size: int | None) -> None:
@@ -44,6 +49,14 @@ class DocsService:
         await self._access.require_admin(admin.id, project_id)
         if not files:
             raise NoFilesToUpload
+        if self._knowledge_publisher is not None:
+            publication = await self._knowledge_publisher.ingest_and_publish(
+                project_id,
+                mode,
+                files,
+                created_by_id=admin.id,
+            )
+            return publication.doc_update
         summary = await self._llm.upload_documents(project_id, mode, files)
         await self._project_work.bump_docs_version(project_id)
         return await self._doc_update_work.create(project_id, admin.id, mode, summary)

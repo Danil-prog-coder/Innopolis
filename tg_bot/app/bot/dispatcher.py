@@ -44,6 +44,8 @@ def build_dispatcher(
     for observer in (dp.message, dp.callback_query):
         observer.outer_middleware(user_middleware)
         observer.middleware(depends_middleware)
+    # Draft stop updates have no from_user; only dependency resolution is needed.
+    dp.observers["stopped_message_generation"].middleware(depends_middleware)
     dp.include_router(setup_routers())
     if catch_errors:
         dp.errors.register(on_error)

@@ -16,8 +16,17 @@ from app.bot.notifier import Notifier
 from app.config import Settings
 from app.core.depends import Depends, DependsResolver
 from app.core.security import ProjectPasswordManager
+from app.llm.concurrency import ProviderConcurrencyLimiter
 from app.llm.gateway import LLMGateway, StubLLMGateway
+from app.llm.openai_stream import OpenAIStreamClient
+from app.llm.published import PublishedSnapshotProvider
+from app.llm.rag_gateway import RagChatGateway, RagGatewayConfig
+from app.rag.embeddings import E5Embedder
+from app.rag.index import RagIndex
+from app.rag.ingestion import RagIngestionService
+from app.rag.store import QdrantChunkStore
 from app.services.access_service import AccessGuard
+from app.services.active_draft_registry import ActiveDraftRegistry
 from app.services.digest_service import DigestService
 from app.services.docs_service import DocsService
 from app.services.group_chat_service import GroupChatService
@@ -31,10 +40,12 @@ from app.storage.postgres.config import MODELS_MODULES
 from app.storage.postgres.doc_update_work import PostgresDocUpdateWork
 from app.storage.postgres.group_chat_work import PostgresGroupChatWork
 from app.storage.postgres.invite_work import PostgresInviteWork
+from app.storage.postgres.knowledge_work import PostgresKnowledgeWork
 from app.storage.postgres.membership_work import PostgresMembershipWork
 from app.storage.postgres.project_ban_work import PostgresProjectBanWork
 from app.storage.postgres.project_work import PostgresProjectWork
 from app.storage.postgres.question_work import PostgresQuestionWork
+from app.storage.postgres.usage_work import PostgresUsageLedger
 from app.storage.postgres.user_work import PostgresUserWork
 from app.storage.redis.answer_cache_work import RedisAnswerCacheWork
 from app.storage.redis.client import RedisClient
@@ -42,6 +53,11 @@ from app.storage.redis.docs_draft_work import RedisDocsDraftWork
 from app.storage.redis.password_reveal_work import RedisPasswordRevealWork
 from app.storage.redis.rate_limit_work import RedisRateLimitWork
 from app.storage.redis.scheduler_work import RedisSchedulerWork
+
+
+class RealModeConfigurationError(RuntimeError):
+    """RAG_MODE=real without complete provider/Qdrant configuration."""
+
 
 # --- Синглтоны ---
 
@@ -75,9 +91,57 @@ def get_obj_redis_client() -> RedisClient:
 
 
 @cache
+def get_obj_rag_index() -> RagIndex:
+    settings = get_obj_settings()
+    store = QdrantChunkStore(
+        settings.rag_qdrant_path,
+        url=settings.rag_qdrant_url or None,
+        api_key=settings.rag_qdrant_api_key.get_secret_value() or None,
+    )
+    return RagIndex(store, E5Embedder())
+
+
+@cache
+def _provider_limiter(limit: int) -> ProviderConcurrencyLimiter:
+    return ProviderConcurrencyLimiter(limit)
+
+
+def get_obj_provider_limiter(
+    settings: Settings = Depends(get_obj_settings),
+) -> ProviderConcurrencyLimiter:
+    return _provider_limiter(settings.llm_max_concurrent_generations)
+
+
+@cache
 def get_obj_llm_gateway() -> LLMGateway:
-    # Здесь подключается реальная реализация ИИ-части, когда она появится
-    return StubLLMGateway()
+    settings = get_obj_settings()
+    if settings.rag_mode == "stub":
+        # Explicit dev/test mode. It never claims a published generation.
+        return StubLLMGateway()
+    if settings.rag_mode != "real":
+        raise RealModeConfigurationError(f"unsupported RAG_MODE={settings.rag_mode!r}")
+    try:
+        provider = OpenAIStreamClient(
+            base_url=settings.llm_base_url,
+            api_key=settings.llm_api_key.get_secret_value(),
+            model=settings.llm_model,
+            max_output_tokens=settings.llm_max_output_tokens,
+            timeout_seconds=settings.llm_timeout_seconds,
+            include_usage=settings.llm_include_usage,
+            chat_completions_path=settings.llm_chat_completions_path,
+        )
+    except ValueError as error:
+        # Fail closed at startup; never silently fall back to stub/compat.
+        raise RealModeConfigurationError(f"invalid real LLM configuration: {error}") from error
+    client = get_obj_postgres_client()
+    return RagChatGateway(
+        index=get_obj_rag_index(),
+        provider=provider,
+        snapshots=PostgresKnowledgeWork(client),
+        config=RagGatewayConfig(max_concurrent_generations=settings.llm_max_concurrent_generations),
+        usage_ledger=PostgresUsageLedger(client),
+        limiter=_provider_limiter(settings.llm_max_concurrent_generations),
+    )
 
 
 @cache
@@ -88,6 +152,11 @@ def get_obj_password_manager() -> ProjectPasswordManager:
 @cache
 def get_obj_notifier() -> Notifier:
     return Notifier(get_obj_bot())
+
+
+@cache
+def get_obj_active_draft_registry() -> ActiveDraftRegistry:
+    return ActiveDraftRegistry()
 
 
 @cache
@@ -138,6 +207,18 @@ def get_obj_doc_update_work(
     return PostgresDocUpdateWork(client)
 
 
+def get_obj_knowledge_work(
+    client: PostgresClient = Depends(get_obj_postgres_client),
+) -> PostgresKnowledgeWork:
+    return PostgresKnowledgeWork(client)
+
+
+def get_obj_usage_ledger(
+    client: PostgresClient = Depends(get_obj_postgres_client),
+) -> PostgresUsageLedger:
+    return PostgresUsageLedger(client)
+
+
 def get_obj_group_chat_work(
     client: PostgresClient = Depends(get_obj_postgres_client),
 ) -> PostgresGroupChatWork:
@@ -183,6 +264,25 @@ def get_obj_scheduler_work(
     client: RedisClient = Depends(get_obj_redis_client),
 ) -> RedisSchedulerWork:
     return RedisSchedulerWork(client)
+
+
+def get_obj_published_snapshots(
+    settings: Settings = Depends(get_obj_settings),
+    knowledge_work: PostgresKnowledgeWork = Depends(get_obj_knowledge_work),
+) -> PublishedSnapshotProvider | None:
+    if settings.rag_mode == "stub":
+        return None
+    return knowledge_work
+
+
+def get_obj_knowledge_publisher(
+    project_work: PostgresProjectWork = Depends(get_obj_project_work),
+    knowledge_work: PostgresKnowledgeWork = Depends(get_obj_knowledge_work),
+    settings: Settings = Depends(get_obj_settings),
+) -> RagIngestionService | None:
+    if settings.rag_mode == "stub":
+        return None
+    return RagIngestionService(get_obj_rag_index(), knowledge_work, project_work)
 
 
 # --- Сервисы ---
@@ -253,6 +353,7 @@ def get_obj_question_service(
     membership_work: PostgresMembershipWork = Depends(get_obj_membership_work),
     access_guard: AccessGuard = Depends(get_obj_access_guard),
     settings: Settings = Depends(get_obj_settings),
+    snapshots: PublishedSnapshotProvider | None = Depends(get_obj_published_snapshots),
 ) -> QuestionService:
     return QuestionService(
         llm_gateway,
@@ -263,6 +364,7 @@ def get_obj_question_service(
         membership_work,
         access_guard,
         settings,
+        snapshots=snapshots,
     )
 
 
@@ -272,8 +374,16 @@ def get_obj_docs_service(
     doc_update_work: PostgresDocUpdateWork = Depends(get_obj_doc_update_work),
     membership_work: PostgresMembershipWork = Depends(get_obj_membership_work),
     access_guard: AccessGuard = Depends(get_obj_access_guard),
+    knowledge_publisher: RagIngestionService | None = Depends(get_obj_knowledge_publisher),
 ) -> DocsService:
-    return DocsService(llm_gateway, project_work, doc_update_work, membership_work, access_guard)
+    return DocsService(
+        llm_gateway,
+        project_work,
+        doc_update_work,
+        membership_work,
+        access_guard,
+        knowledge_publisher,
+    )
 
 
 def get_obj_digest_service(

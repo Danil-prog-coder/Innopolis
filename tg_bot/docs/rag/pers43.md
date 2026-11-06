@@ -1,5 +1,10 @@
 # PERS-43: индексация и retrieval (candidate-only)
 
+> INN-8 addendum: минимальная PG-публикация добавлена отдельно в
+> `app/storage/postgres/knowledge_work.py` и `app/rag/ingestion.py`. Этот
+> документ описывает candidate-слой `app/rag/index.py`; Qdrant по-прежнему
+> остаётся candidate-only.
+
 Статус: реализован baseline в `tg_bot/app/rag`, **без публикации generation**.
 Публикация, PG CAS, `docs_version`, `DocUpdate`/outbox и retention — PERS-48.
 APPEND реализован в candidate-only границе только по явному base snapshot и

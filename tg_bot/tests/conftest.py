@@ -21,10 +21,12 @@ from app.storage.postgres.client import PostgresClient
 from app.storage.postgres.doc_update_work import PostgresDocUpdateWork
 from app.storage.postgres.group_chat_work import PostgresGroupChatWork
 from app.storage.postgres.invite_work import PostgresInviteWork
+from app.storage.postgres.knowledge_work import PostgresKnowledgeWork
 from app.storage.postgres.membership_work import PostgresMembershipWork
 from app.storage.postgres.project_ban_work import PostgresProjectBanWork
 from app.storage.postgres.project_work import PostgresProjectWork
 from app.storage.postgres.question_work import PostgresQuestionWork
+from app.storage.postgres.usage_work import PostgresUsageLedger
 from app.storage.postgres.user_work import PostgresUserWork
 from app.storage.redis.answer_cache_work import RedisAnswerCacheWork
 from app.storage.redis.client import RedisClient
@@ -133,6 +135,16 @@ def doc_update_work(pg_client):
 @pytest.fixture
 def group_chat_work(pg_client):
     return PostgresGroupChatWork(pg_client)
+
+
+@pytest.fixture
+def knowledge_work(pg_client):
+    return PostgresKnowledgeWork(pg_client)
+
+
+@pytest.fixture
+def usage_ledger(pg_client):
+    return PostgresUsageLedger(pg_client)
 
 
 # --- Типовые данные: проект, его создатель-админ, второй админ, пользователь, посторонний ---
