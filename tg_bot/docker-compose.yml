@@ -48,6 +48,11 @@ services:
       POSTGRES_PORT: 5432
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # The embedded Qdrant path must match the named volume below. When
+      # RAG_QDRANT_URL is set, this path is ignored and the external service is used.
+      RAG_QDRANT_PATH: /srv/tg_bot/data/qdrant
+    volumes:
+      - qdrant_data:/srv/tg_bot/data/qdrant
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,3 +62,4 @@ services:
 volumes:
   pg_data:
   redis_data:
+  qdrant_data:

@@ -16,7 +16,9 @@ RUN uv sync --frozen --no-dev
 
 COPY . .
 
-RUN useradd --system --uid 10001 bot && chown -R bot /srv/tg_bot
+RUN mkdir -p /srv/tg_bot/data/qdrant \
+    && useradd --system --uid 10001 bot \
+    && chown -R bot /srv/tg_bot
 USER bot
 
 CMD ["sh", "-c", "aerich upgrade && python -m app"]
